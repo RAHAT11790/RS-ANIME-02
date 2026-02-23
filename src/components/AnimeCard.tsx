@@ -2,6 +2,7 @@ import { useState, useEffect } from "react";
 import { Star, Heart } from "lucide-react";
 import type { AnimeItem } from "@/data/animeData";
 import { db, ref, set, remove, onValue } from "@/lib/firebase";
+import { getAnimeTitleStyle } from "@/lib/animeFonts";
 
 interface AnimeCardProps {
   anime: AnimeItem;
@@ -52,15 +53,15 @@ const AnimeCard = ({ anime, onClick }: AnimeCardProps) => {
       >
         <Heart className={`w-3.5 h-3.5 ${isInWatchlist ? "fill-white text-white" : "text-foreground"}`} />
       </button>
-      <span className="absolute top-1.5 right-1.5 gradient-primary px-2 py-0.5 rounded text-[9px] font-bold shadow-[0_3px_12px_hsla(355,85%,55%,0.4)] text-primary-foreground">
+      <span className="absolute top-1.5 right-1.5 bg-accent px-2 py-0.5 rounded text-[9px] font-bold shadow-[0_3px_12px_hsla(38,90%,55%,0.4)] text-accent-foreground">
         {anime.year}
       </span>
       <div className="absolute bottom-0 left-0 right-0 p-2">
-        <p className="text-[11px] font-semibold leading-tight line-clamp-2" style={{ textShadow: "0 2px 8px rgba(0,0,0,0.9)" }}>
+        <p className="text-[11px] font-semibold leading-tight line-clamp-2" style={{ ...getAnimeTitleStyle(anime.title), textShadow: "0 2px 8px rgba(0,0,0,0.9)" }}>
           {anime.title}
         </p>
         <p className="text-[8px] text-secondary-foreground flex items-center gap-1 mt-1">
-          <Star className="w-2 h-2 text-yellow-400" /> {anime.rating}
+          <Star className="w-2 h-2 text-accent" /> {anime.rating}
         </p>
       </div>
     </div>
