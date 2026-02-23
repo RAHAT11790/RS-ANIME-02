@@ -12,6 +12,16 @@ interface QualityOption {
   src: string;
 }
 
+// Proxy HTTP URLs through edge function to avoid mixed content blocking
+const proxyHttpUrl = (url: string): string => {
+  if (!url) return url;
+  if (url.startsWith("http://")) {
+    const proxyBase = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/video-proxy`;
+    return `${proxyBase}?url=${encodeURIComponent(url)}`;
+  }
+  return url;
+};
+
 interface VideoPlayerProps {
   src: string;
   title: string;
@@ -58,12 +68,14 @@ const VideoPlayer = ({ src, title, subtitle, onClose, onNextEpisode, episodeList
   const [cropIndex, setCropIndex] = useState(0);
   const [settingsTab, setSettingsTab] = useState<"speed" | "quality">("speed");
   const [currentQuality, setCurrentQuality] = useState<string>("Auto");
-  const [currentSrc, setCurrentSrc] = useState(src);
+  const [currentSrc, setCurrentSrc] = useState(proxyHttpUrl(src));
+  const isProxied = currentSrc.includes('/functions/v1/video-proxy');
   const [isPremium, setIsPremium] = useState(false);
   const [adGateActive, setAdGateActive] = useState(false);
   const [shortenedLink, setShortenedLink] = useState<string | null>(null);
   const [shortenLoading, setShortenLoading] = useState(false);
   const [showQualityPanel, setShowQualityPanel] = useState(false);
+  const [videoError, setVideoError] = useState(false);
 
   // Check 24h access
   const has24hAccess = useCallback((): boolean => {
@@ -183,13 +195,36 @@ const VideoPlayer = ({ src, title, subtitle, onClose, onNextEpisode, episodeList
 
   // Build quality list
   const availableQualities: QualityOption[] = useMemo(() => {
-    const list: QualityOption[] = [{ label: "Auto", src }];
-    if (qualityOptions?.length) qualityOptions.forEach(q => { if (q.src) list.push(q); });
+    const list: QualityOption[] = [{ label: "Auto", src: proxyHttpUrl(src) }];
+    if (qualityOptions?.length) qualityOptions.forEach(q => { if (q.src) list.push({ ...q, src: proxyHttpUrl(q.src) }); });
     return list;
   }, [src, qualityOptions]);
 
   // Update src on prop change
-  useEffect(() => { setCurrentSrc(src); setCurrentQuality("Auto"); }, [src]);
+  useEffect(() => { setCurrentSrc(proxyHttpUrl(src)); setCurrentQuality("Auto"); setVideoError(false); }, [src]);
+
+  // MediaSession API - show anime title in Chrome notification
+  useEffect(() => {
+    if ('mediaSession' in navigator) {
+      navigator.mediaSession.metadata = new MediaMetadata({
+        title: title,
+        artist: subtitle || 'RS ANIME',
+        album: 'RS ANIME',
+      });
+      navigator.mediaSession.setActionHandler('play', () => { videoRef.current?.play(); });
+      navigator.mediaSession.setActionHandler('pause', () => { videoRef.current?.pause(); });
+      navigator.mediaSession.setActionHandler('seekbackward', () => seek(-10));
+      navigator.mediaSession.setActionHandler('seekforward', () => seek(10));
+      if (onNextEpisode) {
+        navigator.mediaSession.setActionHandler('nexttrack', onNextEpisode);
+      }
+    }
+    return () => {
+      if ('mediaSession' in navigator) {
+        navigator.mediaSession.metadata = null;
+      }
+    };
+  }, [title, subtitle, onNextEpisode]);
 
   const resetHideTimer = useCallback(() => {
     if (hideTimer.current) clearTimeout(hideTimer.current);
@@ -244,11 +279,37 @@ const VideoPlayer = ({ src, title, subtitle, onClose, onNextEpisode, episodeList
       setPlaying(false);
       cancelAnimationFrame(rafId.current);
     };
+    let retryCount = 0;
+    const onError = () => {
+      if (retryCount >= 2) {
+        console.log('Video failed after retries. URL:', currentSrc);
+        setVideoError(true);
+        return;
+      }
+      retryCount++;
+      console.log(`Video error, retry ${retryCount}/2...`);
+      setTimeout(() => {
+        if (v) {
+          const savedTime = v.currentTime;
+          v.load();
+          v.addEventListener('loadedmetadata', () => {
+            if (savedTime > 0) v.currentTime = savedTime;
+            v.play().catch(() => {});
+          }, { once: true });
+        }
+      }, 1500);
+    };
+    const onCanPlay = () => {
+      setVideoError(false);
+      if (v.paused) v.play().catch(() => {});
+    };
 
     v.addEventListener("loadedmetadata", onLoaded);
     v.addEventListener("play", onPlay);
     v.addEventListener("pause", onPause);
     v.addEventListener("ended", onEnded);
+    v.addEventListener("error", onError);
+    v.addEventListener("canplay", onCanPlay);
     v.load();
 
     return () => {
@@ -257,6 +318,8 @@ const VideoPlayer = ({ src, title, subtitle, onClose, onNextEpisode, episodeList
       v.removeEventListener("play", onPlay);
       v.removeEventListener("pause", onPause);
       v.removeEventListener("ended", onEnded);
+      v.removeEventListener("error", onError);
+      v.removeEventListener("canplay", onCanPlay);
     };
   }, [currentSrc]);
 
@@ -302,7 +365,7 @@ const VideoPlayer = ({ src, title, subtitle, onClose, onNextEpisode, episodeList
     if (option.label === currentQuality) { setShowSettings(false); return; }
     const v = videoRef.current;
     pendingSeek.current = v?.currentTime || 0;
-    setCurrentSrc(option.src);
+    setCurrentSrc(proxyHttpUrl(option.src));
     setCurrentQuality(option.label);
     setShowSettings(false);
   }, [currentQuality]);
@@ -371,27 +434,37 @@ const VideoPlayer = ({ src, title, subtitle, onClose, onNextEpisode, episodeList
   const progress = duration > 0 ? (currentTime / duration) * 100 : 0;
 
   return (
-    <div className="fixed inset-0 z-[300] bg-background/[0.98] flex flex-col items-center overflow-y-auto" ref={containerRef}>
+    <div className={`fixed inset-0 z-[300] bg-background/[0.98] flex flex-col items-center ${isFullscreen ? '' : 'overflow-y-auto'}`} ref={containerRef}>
       {/* Close button */}
-      <button onClick={onClose} className="absolute top-5 right-5 z-[310] w-10 h-10 rounded-full gradient-primary flex items-center justify-center btn-glow transition-all hover:rotate-90">
-        <X className="w-5 h-5" />
-      </button>
+      {!isFullscreen && (
+        <button onClick={onClose} className="absolute top-5 right-5 z-[310] w-10 h-10 rounded-full gradient-primary flex items-center justify-center btn-glow transition-all hover:rotate-90">
+          <X className="w-5 h-5" />
+        </button>
+      )}
 
-      <div className="w-full max-w-full p-5">
-        <div className="text-center mb-2.5">
-          <h1 className="text-2xl font-extrabold text-primary text-glow tracking-wider">RS ANIME PLAYER</h1>
-        </div>
+      <div className={`w-full ${isFullscreen ? 'h-full p-0' : 'max-w-full p-5'}`}>
+        {!isFullscreen && (
+          <div className="text-center mb-2.5">
+            <h1 className="text-2xl font-extrabold text-primary text-glow tracking-wider">RS ANIME PLAYER</h1>
+          </div>
+        )}
 
-        <div className="text-center mb-5">
-          <p className="text-lg font-semibold">{title}</p>
-          {subtitle && <p className="text-sm text-secondary-foreground">{subtitle}</p>}
-        </div>
+        {!isFullscreen && (
+          <div className="text-center mb-5">
+            <p className="text-lg font-semibold">{title}</p>
+            {subtitle && <p className="text-sm text-secondary-foreground">{subtitle}</p>}
+          </div>
+        )}
 
         {/* Video Container - will-change for GPU compositing */}
         <div
           ref={videoContainerRef}
-          className="relative w-full bg-black rounded-xl overflow-hidden aspect-video fullscreen:!rounded-none fullscreen:!aspect-auto fullscreen:!w-screen fullscreen:!h-screen"
-          style={{ filter: `brightness(${brightness})`, willChange: "transform" }}
+          className={`relative bg-black overflow-hidden ${
+            isFullscreen 
+              ? "w-screen h-screen rounded-none" 
+              : "w-full rounded-xl aspect-video"
+          }`}
+          style={{ filter: `brightness(${brightness})`, willChange: "transform", margin: isFullscreen ? 0 : undefined }}
           onClick={handleVideoClick}
           onTouchStart={handleTouchStart}
           onTouchMove={handleTouchMove}
@@ -404,10 +477,23 @@ const VideoPlayer = ({ src, title, subtitle, onClose, onNextEpisode, episodeList
             style={{ objectFit: cropModes[cropIndex], willChange: "transform" }}
             playsInline
             preload="auto"
-            crossOrigin="anonymous"
+            {...(isProxied ? { crossOrigin: "anonymous" } : {})}
           />
 
-          {/* Skip Indicators */}
+          {/* Video Error Overlay */}
+          {videoError && (
+            <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/80 z-20">
+              <div className="w-16 h-16 rounded-full bg-destructive/20 flex items-center justify-center mb-4">
+                <X className="w-8 h-8 text-destructive" />
+              </div>
+              <p className="text-base font-semibold text-foreground mb-1">Video Unavailable</p>
+              <p className="text-xs text-muted-foreground mb-4 text-center px-6">Server is not responding. Try another episode or quality.</p>
+              <button onClick={(e) => { e.stopPropagation(); setVideoError(false); const v = videoRef.current; if (v) { v.load(); } }} className="px-4 py-2 rounded-lg gradient-primary text-sm font-semibold btn-glow">
+                Retry
+              </button>
+            </div>
+          )}
+
           {skipIndicator && (
             <div className={`absolute top-1/2 -translate-y-1/2 skip-indicator w-16 h-16 flex items-center justify-center text-foreground text-xl font-bold ${
               skipIndicator.side === "left" ? "left-[15%]" :
