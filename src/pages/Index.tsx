@@ -1,4 +1,10 @@
 import { useState, useMemo, useEffect, useCallback } from "react";
+import type { Episode } from "@/data/animeData";
+
+// Helper: get best available src from episode (fallback if default link is empty)
+const getEpisodeSrc = (ep: Episode): string => {
+  return ep.link || ep.link480 || ep.link720 || ep.link1080 || ep.link4k || "";
+};
 import { AnimatePresence } from "framer-motion";
 import Header from "@/components/Header";
 import BottomNav from "@/components/BottomNav";
@@ -170,7 +176,7 @@ const Index = () => {
     if (anime.type === "webseries" && anime.seasons && seasonIdx !== undefined && epIdx !== undefined) {
       const season = anime.seasons[seasonIdx];
       const episode = season.episodes[epIdx];
-      src = episode.link;
+      src = getEpisodeSrc(episode);
       subtitle = `${season.name} - Episode ${episode.episodeNumber}`;
       if (episode.link480) qualityOptions.push({ label: "480p", src: episode.link480 });
       if (episode.link720) qualityOptions.push({ label: "720p", src: episode.link720 });
@@ -260,7 +266,7 @@ const Index = () => {
       if (anime.seasons) {
         const season = anime.seasons[sIdx];
         const episode = season.episodes[eIdx];
-        src = episode.link;
+        src = getEpisodeSrc(episode);
         subtitle = `${season.name} - Episode ${episode.episodeNumber}`;
         if (episode.link480) qualityOptions.push({ label: "480p", src: episode.link480 });
         if (episode.link720) qualityOptions.push({ label: "720p", src: episode.link720 });
@@ -324,7 +330,7 @@ const Index = () => {
       addToWatchHistory(playerState!.anime, playerState!.seasonIdx, i);
       setPlayerState({
         ...playerState!,
-        src: clickedEp.link,
+        src: getEpisodeSrc(clickedEp),
         subtitle: `${season.name} - Episode ${clickedEp.episodeNumber}`,
         epIdx: i,
         qualityOptions: qOpts.length > 0 ? qOpts : undefined,
@@ -377,7 +383,7 @@ const Index = () => {
   if (loading) {
     return (
       <div className="fixed inset-0 bg-background flex flex-col items-center justify-center z-[9999]">
-        <div className="text-7xl font-black text-primary animate-pulse" style={{ textShadow: "0 0 40px hsla(355,85%,55%,0.5), 0 0 80px hsla(210,90%,55%,0.5)", letterSpacing: "-4px" }}>
+        <div className="text-7xl font-black text-primary animate-pulse" style={{ textShadow: "0 0 40px hsla(170,75%,45%,0.5), 0 0 80px hsla(38,90%,55%,0.5)", letterSpacing: "-4px" }}>
           RS
         </div>
         <p className="mt-4 text-xs text-muted-foreground uppercase tracking-[3px]">Loading...</p>
@@ -531,7 +537,7 @@ const Index = () => {
                   addToWatchHistory(playerState.anime, playerState.seasonIdx, nextIdx);
                   setPlayerState({
                     ...playerState,
-                    src: nextEp.link,
+                    src: getEpisodeSrc(nextEp),
                     subtitle: `${season.name} - Episode ${nextEp.episodeNumber}`,
                     epIdx: nextIdx,
                     qualityOptions: qOpts.length > 0 ? qOpts : undefined,
