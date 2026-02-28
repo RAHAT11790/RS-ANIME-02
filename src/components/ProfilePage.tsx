@@ -1,9 +1,10 @@
-import { useState, useRef, useEffect } from "react";
-import { User, LogOut, History, Bookmark, Settings, ChevronRight, ArrowLeft, Camera, X, Save, Globe, Monitor, Bell, Info, Crown, Gift, Check, Lock, Eye, EyeOff, KeyRound, Clock } from "lucide-react";
+import { useState, useRef, useEffect, forwardRef } from "react";
+import { User, LogOut, History, Bookmark, Settings, ChevronRight, ArrowLeft, Camera, X, Save, Globe, Monitor, Bell, Info, Crown, Gift, Check, Lock, Eye, EyeOff, KeyRound, Clock, Download, Play, Trash2, Loader2 } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import { db, ref, onValue, set, remove, get, update, query, orderByChild, equalTo } from "@/lib/firebase";
 import type { AnimeItem } from "@/data/animeData";
 import { toast } from "sonner";
+import { registerFCMToken } from "@/lib/fcm";
 
 interface ProfilePageProps {
   onClose: () => void;
@@ -18,6 +19,7 @@ const AccessTimer = () => {
   const [timeLeft, setTimeLeft] = useState<string | null>(null);
   const [hasAccess, setHasAccess] = useState(false);
   const [paused, setPaused] = useState(false);
+  const [globalFree, setGlobalFree] = useState<{ active: boolean; expiresAt: number } | null>(null);
 
   // Check maintenance status and pause/extend timer
   useEffect(() => {
@@ -27,7 +29,6 @@ const AccessTimer = () => {
         setPaused(true);
       } else {
         setPaused(false);
-        // If there was a pause, extend free access timer
         if (maint?.lastPauseDuration && maint?.lastResumedAt) {
           const appliedKey = `rsanime_pause_applied_${maint.lastResumedAt}`;
           if (!localStorage.getItem(appliedKey)) {
@@ -44,8 +45,31 @@ const AccessTimer = () => {
     return () => unsub();
   }, []);
 
+  // Listen for global free access
+  useEffect(() => {
+    const unsub = onValue(ref(db, "globalFreeAccess"), (snap) => {
+      const data = snap.val();
+      if (data?.active && data?.expiresAt > Date.now()) {
+        setGlobalFree(data);
+      } else {
+        setGlobalFree(null);
+      }
+    });
+    return () => unsub();
+  }, []);
+
   useEffect(() => {
     const tick = () => {
+      // Check global free access first
+      if (globalFree?.active && globalFree.expiresAt > Date.now()) {
+        setHasAccess(true);
+        const diff = globalFree.expiresAt - Date.now();
+        const h = Math.floor(diff / 3600000);
+        const m = Math.floor((diff % 3600000) / 60000);
+        const s = Math.floor((diff % 60000) / 1000);
+        setTimeLeft(`${h.toString().padStart(2, "0")}:${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}`);
+        return;
+      }
       const expiry = localStorage.getItem("rsanime_ad_access");
       if (!expiry) { setHasAccess(false); setTimeLeft(null); return; }
       const diff = parseInt(expiry) - Date.now();
@@ -59,7 +83,7 @@ const AccessTimer = () => {
     tick();
     const interval = setInterval(tick, 1000);
     return () => clearInterval(interval);
-  }, []);
+  }, [globalFree]);
 
   return (
     <div className="mb-5">
@@ -84,8 +108,207 @@ const AccessTimer = () => {
   );
 };
 
-const ProfilePage = ({ onClose, allAnime = [], onCardClick, onLogout }: ProfilePageProps) => {
-  const [activePanel, setActivePanel] = useState<"main" | "settings" | "edit" | "language" | "quality" | "notification-settings" | "premium" | "change-password">("main");
+// Downloads Panel Component
+const DownloadsPanel = ({ onBack }: { onBack: () => void }) => {
+  const [downloads, setDownloads] = useState<any[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [playingVideo, setPlayingVideo] = useState<string | null>(null);
+  const [playingUrl, setPlayingUrl] = useState<string | null>(null);
+  const videoPlayRef = useRef<HTMLVideoElement>(null);
+  const [activeDownloads, setActiveDownloads] = useState<Map<string, any>>(new Map());
+
+  const loadDownloads = async () => {
+    try {
+      const { getAllDownloads } = await import("@/lib/downloadStore");
+      const items = await getAllDownloads();
+      setDownloads(items);
+    } catch {}
+    setLoading(false);
+  };
+
+  useEffect(() => { loadDownloads(); }, []);
+
+  // Subscribe to global download manager
+  useEffect(() => {
+    let unsub: (() => void) | undefined;
+    import("@/lib/downloadManager").then(({ downloadManager }) => {
+      unsub = downloadManager.subscribe((map) => {
+        setActiveDownloads(new Map(map));
+        // Refresh completed downloads list
+        const hasComplete = Array.from(map.values()).some(d => d.status === "complete");
+        if (hasComplete) loadDownloads();
+      });
+    });
+    return () => { unsub?.(); };
+  }, []);
+
+  useEffect(() => {
+    return () => { if (playingUrl) URL.revokeObjectURL(playingUrl); };
+  }, [playingUrl]);
+
+  const handlePlay = async (id: string) => {
+    try {
+      const { getVideoBlob } = await import("@/lib/downloadStore");
+      const blob = await getVideoBlob(id);
+      if (!blob) { toast.error("Video file not found"); return; }
+      if (playingUrl) URL.revokeObjectURL(playingUrl);
+      const url = URL.createObjectURL(blob);
+      setPlayingUrl(url);
+      setPlayingVideo(id);
+    } catch { toast.error("Failed to load video"); }
+  };
+
+  const handleDelete = async (id: string) => {
+    try {
+      const { deleteDownload } = await import("@/lib/downloadStore");
+      await deleteDownload(id);
+      setDownloads(prev => prev.filter(d => d.id !== id));
+      if (playingVideo === id) {
+        setPlayingVideo(null);
+        if (playingUrl) URL.revokeObjectURL(playingUrl);
+        setPlayingUrl(null);
+      }
+      toast.success("Download deleted");
+    } catch {
+      toast.error("Failed to delete download");
+    }
+  };
+
+  const formatSize = (bytes: number) => {
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  };
+
+  // Merge active downloads with saved downloads
+  const activeList = Array.from(activeDownloads.values())
+    .filter((d: any) => d.status === "downloading")
+    .sort((a: any, b: any) => b.percent - a.percent);
+
+  return (
+    <motion.div className="fixed inset-0 z-[200] bg-background overflow-y-auto pt-[70px] px-4 pb-24"
+      initial={{ x: "100%" }} animate={{ x: 0 }} exit={{ x: "100%" }}
+      transition={{ type: "tween", duration: 0.3 }}>
+      <button onClick={onBack} className="flex items-center gap-2 mb-5 text-sm text-secondary-foreground hover:text-foreground transition-colors">
+        <ArrowLeft className="w-5 h-5" />
+        <span className="font-medium">Downloads</span>
+      </button>
+
+      {playingVideo && playingUrl && (
+        <div className="fixed inset-0 z-[300] bg-black flex flex-col">
+          <div className="flex items-center justify-between p-3 bg-black/80">
+            <p className="text-sm font-medium text-white truncate flex-1">
+              {downloads.find(d => d.id === playingVideo)?.title || "Video"}
+              {downloads.find(d => d.id === playingVideo)?.subtitle && (
+                <span className="text-muted-foreground ml-1 text-xs">
+                  {downloads.find(d => d.id === playingVideo)?.subtitle}
+                </span>
+              )}
+            </p>
+            <button onClick={() => { setPlayingVideo(null); if (playingUrl) URL.revokeObjectURL(playingUrl); setPlayingUrl(null); }}
+              className="w-8 h-8 rounded-full bg-foreground/20 flex items-center justify-center ml-2">
+              <X className="w-4 h-4 text-white" />
+            </button>
+          </div>
+          <div className="flex-1 flex items-center justify-center">
+            <video
+              ref={videoPlayRef}
+              src={playingUrl}
+              className="w-full h-full"
+              controls
+              autoPlay
+              playsInline
+              style={{ objectFit: "contain" }}
+            />
+          </div>
+        </div>
+      )}
+
+      {/* Active Downloads Section */}
+      {activeList.length > 0 && (
+        <div className="mb-4 space-y-2">
+          <p className="text-xs font-semibold text-primary uppercase tracking-wider">Downloading now</p>
+          {activeList.map((dl: any) => (
+            <div key={dl.id} className="glass-card rounded-xl p-3 border border-primary/20">
+              <div className="flex items-center gap-3 mb-2">
+                <div className="w-10 h-10 rounded-lg bg-primary/20 flex items-center justify-center flex-shrink-0">
+                  <Loader2 className="w-5 h-5 text-primary animate-spin" />
+                </div>
+                <div className="flex-1 min-w-0">
+                  <p className="text-sm font-semibold truncate">{dl.title}</p>
+                  {dl.subtitle && <p className="text-xs text-primary truncate">{dl.subtitle}</p>}
+                  <div className="flex items-center gap-2 mt-0.5">
+                    <span className="text-xs font-mono text-primary">{dl.percent}%</span>
+                    <span className="text-[10px] text-muted-foreground">
+                      {dl.loadedMB.toFixed(1)}/{dl.totalMB > 0 ? dl.totalMB.toFixed(1) : "??"} MB
+                    </span>
+                    {dl.quality !== "Auto" && (
+                      <span className="text-[10px] px-1.5 py-0.5 rounded bg-primary/10 text-primary">{dl.quality}</span>
+                    )}
+                  </div>
+                </div>
+              </div>
+              <div className="w-full h-1.5 rounded-full bg-foreground/10 overflow-hidden">
+                <div className="h-full rounded-full gradient-primary transition-all duration-300 ease-linear" style={{ width: `${dl.percent}%` }} />
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {loading ? (
+        <div className="py-16 text-center">
+          <Loader2 className="w-8 h-8 animate-spin text-primary mx-auto mb-3" />
+          <p className="text-sm text-muted-foreground">Loading downloads...</p>
+        </div>
+      ) : downloads.length === 0 && activeList.length === 0 ? (
+        <div className="py-16 text-center text-muted-foreground">
+          <Download className="w-14 h-14 mx-auto mb-3 opacity-30" />
+          <h3 className="text-base font-semibold mb-2 text-foreground">No downloads yet</h3>
+          <p className="text-sm px-4">Open the video player and tap Download Episode to save videos.</p>
+        </div>
+      ) : (
+        <div className="space-y-3">
+          {downloads.length > 0 && (
+            <p className="text-xs text-muted-foreground">{downloads.length} videos saved</p>
+          )}
+          {downloads.map((item) => (
+            <div key={item.id} className="glass-card rounded-xl p-3 flex items-center gap-3">
+              <button onClick={() => handlePlay(item.id)}
+                className="w-12 h-12 rounded-lg overflow-hidden flex items-center justify-center flex-shrink-0 relative">
+                {item.poster ? (
+                  <img src={item.poster} alt={item.title} className="w-full h-full object-cover" />
+                ) : (
+                  <div className="w-full h-full gradient-primary flex items-center justify-center">
+                    <Play className="w-5 h-5 text-primary-foreground" />
+                  </div>
+                )}
+                <div className="absolute inset-0 bg-black/30 flex items-center justify-center">
+                  <Play className="w-4 h-4 text-white" />
+                </div>
+              </button>
+              <div className="flex-1 min-w-0">
+                <p className="text-sm font-semibold truncate">{item.title}</p>
+                {item.subtitle && <p className="text-xs text-primary truncate">{item.subtitle}</p>}
+                <p className="text-[10px] text-muted-foreground mt-0.5">
+                  {formatSize(item.size)}
+                  {item.quality ? ` • ${item.quality}` : ""}
+                  {` • ${new Date(item.downloadedAt).toLocaleDateString("en-US")}`}
+                </p>
+              </div>
+              <button onClick={() => handleDelete(item.id)}
+                className="w-8 h-8 rounded-full bg-destructive/20 flex items-center justify-center flex-shrink-0 hover:bg-destructive/40 transition-colors">
+                <Trash2 className="w-3.5 h-3.5 text-destructive" />
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+    </motion.div>
+  );
+};
+
+const ProfilePageInner = ({ onClose, allAnime = [], onCardClick, onLogout }: ProfilePageProps) => {
+  const [activePanel, setActivePanel] = useState<"main" | "settings" | "edit" | "language" | "quality" | "notification-settings" | "premium" | "change-password" | "downloads">("main");
   const [profilePhoto, setProfilePhoto] = useState<string | null>(() => {
     try { return localStorage.getItem("rs_profile_photo"); } catch { return null; }
   });
@@ -340,10 +563,14 @@ const ProfilePage = ({ onClose, allAnime = [], onCardClick, onLogout }: ProfileP
           <span className="font-medium">Notifications</span>
         </button>
         <div className="space-y-3">
+          <NotificationToggle label="Push Notifications" desc="Show browser popup notifications" defaultOn={true} storageKey="rs_notif_push" />
           <NotificationToggle label="New Episode Alerts" desc="Get notified for new episodes" defaultOn={true} storageKey="rs_notif_episodes" />
           <NotificationToggle label="Recommendations" desc="Personalized anime suggestions" defaultOn={true} storageKey="rs_notif_recs" />
           <NotificationToggle label="App Updates" desc="New features and improvements" defaultOn={false} storageKey="rs_notif_updates" />
         </div>
+
+        {/* Push Debug Info */}
+        <PushDebugInfo />
       </motion.div>
     );
   }
@@ -409,6 +636,11 @@ const ProfilePage = ({ onClose, allAnime = [], onCardClick, onLogout }: ProfileP
         )}
       </motion.div>
     );
+  }
+
+  // Downloads Panel
+  if (activePanel === "downloads") {
+    return <DownloadsPanel onBack={() => setActivePanel("main")} />;
   }
 
   // Change Password Panel
@@ -592,6 +824,12 @@ const ProfilePage = ({ onClose, allAnime = [], onCardClick, onLogout }: ProfileP
           <span className="flex-1 text-[13px] font-medium">Settings</span>
           <ChevronRight className="w-3 h-3 text-muted-foreground" />
         </div>
+        <div onClick={() => setActivePanel("downloads")}
+          className="glass-card flex items-center gap-3.5 px-4 py-4 cursor-pointer transition-all hover:border-primary hover:translate-x-1 rounded-xl">
+          <Download className="w-5 h-5 text-primary" />
+          <span className="flex-1 text-[13px] font-medium">Downloads</span>
+          <ChevronRight className="w-3 h-3 text-muted-foreground" />
+        </div>
         <div onClick={() => { setTempName(displayName); setActivePanel("edit"); }}
           className="glass-card flex items-center gap-3.5 px-4 py-4 cursor-pointer transition-all hover:border-primary hover:translate-x-1 rounded-xl">
           <User className="w-5 h-5 text-primary" />
@@ -604,6 +842,21 @@ const ProfilePage = ({ onClose, allAnime = [], onCardClick, onLogout }: ProfileP
           <span className="flex-1 text-[13px] font-medium">Logout</span>
           <ChevronRight className="w-3 h-3 text-muted-foreground" />
         </div>
+
+        {/* Telegram Join Button */}
+        <a
+          href="https://t.me/cartoonfunny03"
+          target="_blank"
+          rel="noopener noreferrer"
+          className="flex items-center justify-center gap-2.5 w-full py-3.5 rounded-xl font-semibold text-sm transition-all mt-2"
+          style={{ background: 'linear-gradient(135deg, #0088cc, #00aaee)', color: '#fff' }}
+        >
+          <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
+            <path d="M11.944 0A12 12 0 0 0 0 12a12 12 0 0 0 12 12 12 12 0 0 0 12-12A12 12 0 0 0 12 0a12 12 0 0 0-.056 0zm4.962 7.224c.1-.002.321.023.465.14a.506.506 0 0 1 .171.325c.016.093.036.306.02.472-.18 1.898-.962 6.502-1.36 8.627-.168.9-.499 1.201-.82 1.23-.696.065-1.225-.46-1.9-.902-1.056-.693-1.653-1.124-2.678-1.8-1.185-.78-.417-1.21.258-1.91.177-.184 3.247-2.977 3.307-3.23.007-.032.014-.15-.056-.212s-.174-.041-.249-.024c-.106.024-1.793 1.14-5.061 3.345-.48.33-.913.49-1.302.48-.428-.008-1.252-.241-1.865-.44-.752-.245-1.349-.374-1.297-.789.027-.216.325-.437.893-.663 3.498-1.524 5.83-2.529 6.998-3.014 3.332-1.386 4.025-1.627 4.476-1.635z"/>
+          </svg>
+          Join Our Telegram Channel
+        </a>
+        <p className="text-[10px] text-muted-foreground text-center mt-1 mb-2">Get all updates, news & details about RS ANIME</p>
       </div>
     </motion.div>
   );
@@ -722,18 +975,140 @@ const ChangePasswordPanel = ({ onBack }: { onBack: () => void }) => {
   );
 };
 
-// Notification toggle sub-component
+// Push Debug Info sub-component
+const PushDebugInfo = () => {
+  const [debugInfo, setDebugInfo] = useState<Record<string, string>>({});
+  const [reregistering, setReregistering] = useState(false);
+
+  const loadDebugInfo = () => {
+    const info: Record<string, string> = {};
+    info["Origin"] = window.location.origin;
+    info["Permission"] = "Notification" in window ? Notification.permission : "unsupported";
+    info["Device ID"] = localStorage.getItem("rs_fcm_device_id") || "not set";
+    
+    try {
+      const u = JSON.parse(localStorage.getItem("rsanime_user") || "{}");
+      info["User ID"] = u.id || "none";
+    } catch { info["User ID"] = "error"; }
+
+    info["Push Pref"] = localStorage.getItem("rs_notif_push") || "default (true)";
+    info["SW Support"] = "serviceWorker" in navigator ? "yes" : "no";
+    
+    // Check SW registration
+    if ("serviceWorker" in navigator) {
+      navigator.serviceWorker.getRegistrations().then((regs) => {
+        const fcmSw = regs.find(r => r.active?.scriptURL?.includes("firebase-messaging-sw"));
+        info["FCM SW"] = fcmSw ? `active (scope: ${fcmSw.scope})` : "not registered";
+        info["Total SWs"] = String(regs.length);
+        setDebugInfo({ ...info });
+      });
+    }
+
+    // Load token count from Firebase
+    try {
+      const u = JSON.parse(localStorage.getItem("rsanime_user") || "{}");
+      if (u.id) {
+        import("@/lib/firebase").then(({ db, ref, get }) => {
+          get(ref(db, `fcmTokens/${u.id}`)).then((snap: any) => {
+            const tokens = snap.val() || {};
+            const entries = Object.values(tokens) as any[];
+            info["Token Count"] = String(entries.length);
+            if (entries.length > 0) {
+              const latest = entries.reduce((a: any, b: any) => (a.updatedAt || 0) > (b.updatedAt || 0) ? a : b);
+              info["Last Token"] = latest.updatedAt ? new Date(latest.updatedAt).toLocaleString() : "unknown";
+              // Check if current origin has a token
+              const originMatch = entries.find((e: any) => e.origin === window.location.origin);
+              info["This Origin"] = originMatch ? "✅ has token" : "❌ no token";
+            }
+            setDebugInfo({ ...info });
+          }).catch(() => {});
+        });
+      }
+    } catch {}
+    
+    setDebugInfo(info);
+  };
+
+  useEffect(() => { loadDebugInfo(); }, []);
+
+  const handleForceReregister = async () => {
+    setReregistering(true);
+    try {
+      const u = JSON.parse(localStorage.getItem("rsanime_user") || "{}");
+      if (!u.id) {
+        toast.error("No user ID found");
+        setReregistering(false);
+        return;
+      }
+      await registerFCMToken(u.id, true);
+      // Reload debug info after re-register
+      setTimeout(() => loadDebugInfo(), 1500);
+    } catch (err: any) {
+      toast.error("Re-register failed: " + err.message);
+    }
+    setReregistering(false);
+  };
+
+  return (
+    <div className="mt-6 glass-card p-4 rounded-xl">
+      <h4 className="text-xs font-bold text-primary mb-3 flex items-center gap-2">
+        <Info className="w-3.5 h-3.5" /> Push Debug Info
+      </h4>
+      <div className="space-y-1.5">
+        {Object.entries(debugInfo).map(([key, val]) => (
+          <div key={key} className="flex justify-between text-[11px]">
+            <span className="text-muted-foreground">{key}:</span>
+            <span className="text-foreground font-mono text-right max-w-[60%] truncate">{val}</span>
+          </div>
+        ))}
+      </div>
+      <button 
+        onClick={handleForceReregister} 
+        disabled={reregistering}
+        className="w-full mt-3 py-2.5 rounded-xl bg-primary/20 text-primary text-xs font-semibold flex items-center justify-center gap-2 transition-all hover:bg-primary/30 disabled:opacity-50"
+      >
+        {reregistering ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Bell className="w-3.5 h-3.5" />}
+        Force Re-register Push Token
+      </button>
+    </div>
+  );
+};
+
+
 const NotificationToggle = ({ label, desc, defaultOn, storageKey }: { label: string; desc: string; defaultOn: boolean; storageKey: string }) => {
   const [enabled, setEnabled] = useState(() => {
     try { const v = localStorage.getItem(storageKey); return v !== null ? v === "true" : defaultOn; } catch { return defaultOn; }
   });
-  const toggle = () => {
+  const toggle = async () => {
     const next = !enabled;
-    setEnabled(next);
-    localStorage.setItem(storageKey, String(next));
+
+    if (storageKey === "rs_notif_push" && next) {
+      try {
+        // Force browser permission prompt first
+        if ("Notification" in window && Notification.permission === "default") {
+          const permission = await Notification.requestPermission();
+          if (permission !== "granted") {
+            toast.error("নোটিফিকেশন অনুমতি দেওয়া হয়নি। ব্রাউজার সেটিংস থেকে Allow করুন।");
+            return; // Don't toggle on if not granted
+          }
+        } else if ("Notification" in window && Notification.permission === "denied") {
+          toast.error("❌ নোটিফিকেশন ব্লক করা আছে! ব্রাউজার Settings → Notifications → Allow করুন।");
+          return;
+        }
+        setEnabled(next);
+        localStorage.setItem(storageKey, String(next));
+        const u = JSON.parse(localStorage.getItem("rsanime_user") || "{}");
+        if (u?.id) await registerFCMToken(u.id, true);
+      } catch {
+        setEnabled(!next);
+      }
+    } else {
+      setEnabled(next);
+      localStorage.setItem(storageKey, String(next));
+    }
   };
   return (
-    <div onClick={toggle} className="glass-card px-4 py-4 rounded-xl cursor-pointer transition-all hover:border-primary flex items-center justify-between">
+    <div onClick={() => { void toggle(); }} className="glass-card px-4 py-4 rounded-xl cursor-pointer transition-all hover:border-primary flex items-center justify-between">
       <div>
         <p className="text-sm font-medium">{label}</p>
         <p className="text-[11px] text-muted-foreground mt-0.5">{desc}</p>
@@ -744,5 +1119,11 @@ const NotificationToggle = ({ label, desc, defaultOn, storageKey }: { label: str
     </div>
   );
 };
+
+const ProfilePage = forwardRef<HTMLDivElement, ProfilePageProps>((props, _ref) => {
+  return <ProfilePageInner {...props} />;
+});
+
+ProfilePage.displayName = "ProfilePage";
 
 export default ProfilePage;
