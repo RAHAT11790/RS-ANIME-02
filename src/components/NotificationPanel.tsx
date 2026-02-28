@@ -3,12 +3,61 @@ import { Bell, X, Check, ArrowLeft } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import { db, ref, onValue, set, update } from "@/lib/firebase";
 
-interface Notification {
+// Request notification permission and register FCM SW
+const requestNotificationPermission = async () => {
+  if (!("Notification" in window) || !("serviceWorker" in navigator)) return;
+  if (Notification.permission === "default") {
+    await Notification.requestPermission();
+  }
+  try {
+    await navigator.serviceWorker.register("/firebase-messaging-sw.js", { scope: "/" });
+  } catch {}
+};
+
+// Show browser notification (foreground only) with duplicate guard
+const showBrowserNotification = (title: string, body: string, contentId?: string, image?: string): boolean => {
+  // Respect user's push notification preference
+  try {
+    const pushPref = localStorage.getItem("rs_notif_push");
+    if (pushPref === "false") return false;
+  } catch {}
+
+  if (!("Notification" in window) || Notification.permission !== "granted") return false;
+
+
+  try {
+    const options = {
+      body,
+      icon: "https://i.ibb.co.com/gLc93Bc3/android-chrome-512x512.png",
+      badge: "https://i.ibb.co.com/gLc93Bc3/android-chrome-512x512.png",
+      image: image || undefined,
+      tag: contentId ? `rsanime-${contentId}` : `rsanime-${Date.now()}`,
+      data: { url: contentId ? `/?anime=${contentId}` : "/" },
+      vibrate: [200, 100, 200],
+      requireInteraction: false,
+    } as NotificationOptions;
+
+    if (navigator.serviceWorker?.controller) {
+      navigator.serviceWorker.ready.then((reg) => {
+        reg.showNotification(title, options);
+      });
+    } else {
+      new Notification(title, options);
+    }
+
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+interface NotifItem {
   id: string;
   title: string;
   message: string;
   type?: string;
   contentId?: string;
+  image?: string;
   read: boolean;
   timestamp: number;
 }
@@ -18,21 +67,52 @@ interface NotificationPanelProps {
   onOpenContent?: (contentId: string) => void;
 }
 
+// Helper to track which notifications already triggered a browser push
+const SHOWN_PUSH_KEY = "rs_shown_push_ids";
+const getShownPushIds = (): Set<string> => {
+  try {
+    const raw = localStorage.getItem(SHOWN_PUSH_KEY);
+    return raw ? new Set(JSON.parse(raw)) : new Set();
+  } catch { return new Set(); }
+};
+const addShownPushId = (id: string) => {
+  try {
+    const ids = getShownPushIds();
+    ids.add(id);
+    // Keep only last 200 IDs to prevent unbounded growth
+    const arr = [...ids].slice(-200);
+    localStorage.setItem(SHOWN_PUSH_KEY, JSON.stringify(arr));
+  } catch {}
+};
+
 const NotificationPanel = ({ userId, onOpenContent }: NotificationPanelProps) => {
-  const [notifications, setNotifications] = useState<Notification[]>([]);
+  const [notifications, setNotifications] = useState<NotifItem[]>([]);
   const [showFullPage, setShowFullPage] = useState(false);
   const dropdownRef = useRef<HTMLDivElement>(null);
+  const knownNotifIdsRef = useRef<Set<string>>(new Set());
+
+  // Request notification permission on mount
+  useEffect(() => {
+    requestNotificationPermission();
+  }, []);
 
   useEffect(() => {
     if (!userId) {
       setNotifications([]);
+      knownNotifIdsRef.current = new Set();
       return;
     }
+
     const notifsRef = ref(db, `notifications/${userId}`);
     const unsub = onValue(notifsRef, (snapshot) => {
       const data = snapshot.val();
-      if (!data) { setNotifications([]); return; }
-      const items: Notification[] = [];
+      if (!data) {
+        setNotifications([]);
+        knownNotifIdsRef.current = new Set();
+        return;
+      }
+
+      const items: NotifItem[] = [];
       Object.entries(data).forEach(([id, item]: [string, any]) => {
         items.push({
           id,
@@ -40,14 +120,36 @@ const NotificationPanel = ({ userId, onOpenContent }: NotificationPanelProps) =>
           message: item.message || "",
           type: item.type || "",
           contentId: item.contentId || "",
+          image: item.image || item.poster || "",
           read: item.read || false,
           timestamp: item.timestamp || Date.now(),
         });
       });
       items.sort((a, b) => b.timestamp - a.timestamp);
+
+      const shownIds = getShownPushIds();
+      const unreadUnshown = items.filter((item) => !item.read && !shownIds.has(item.id));
+      const isFirstHydration = knownNotifIdsRef.current.size === 0;
+
+      const candidates = (isFirstHydration
+        ? unreadUnshown
+        : unreadUnshown.filter((item) => !knownNotifIdsRef.current.has(item.id)))
+        .slice(0, 5)
+        .reverse();
+
+      candidates.forEach((item) => {
+        const displayed = showBrowserNotification(item.title, item.message, item.contentId, item.image);
+        if (displayed) addShownPushId(item.id);
+      });
+
+      knownNotifIdsRef.current = new Set(items.map((item) => item.id));
       setNotifications(items);
     });
-    return () => unsub();
+
+    return () => {
+      unsub();
+      knownNotifIdsRef.current = new Set();
+    };
   }, [userId]);
 
   const unreadCount = notifications.filter((n) => !n.read).length;
@@ -63,7 +165,7 @@ const NotificationPanel = ({ userId, onOpenContent }: NotificationPanelProps) =>
     }
   };
 
-  const openNotification = (notif: Notification) => {
+  const openNotification = (notif: NotifItem) => {
     if (!notif.read && userId) {
       set(ref(db, `notifications/${userId}/${notif.id}/read`), true);
     }
@@ -134,9 +236,16 @@ const NotificationPanel = ({ userId, onOpenContent }: NotificationPanelProps) =>
                   }`}
                 >
                   <div className="flex items-start gap-3">
-                    {!notif.read && <span className="mt-1.5 w-2 h-2 rounded-full bg-primary flex-shrink-0" />}
+                    {notif.image ? (
+                      <img src={notif.image} alt="" className="w-10 h-10 rounded-lg object-cover flex-shrink-0 mt-0.5" />
+                    ) : (
+                      !notif.read && <span className="mt-1.5 w-2 h-2 rounded-full bg-primary flex-shrink-0" />
+                    )}
                     <div className="flex-1 min-w-0">
-                      <p className="text-sm font-semibold leading-tight">{notif.title}</p>
+                      <div className="flex items-center gap-1.5">
+                        {!notif.read && notif.image && <span className="w-2 h-2 rounded-full bg-primary flex-shrink-0" />}
+                        <p className="text-sm font-semibold leading-tight">{notif.title}</p>
+                      </div>
                       <p className="text-xs text-muted-foreground mt-0.5 line-clamp-2">{notif.message}</p>
                       <p className="text-[10px] text-primary/70 mt-1">{timeAgo(notif.timestamp)}</p>
                     </div>
