@@ -2,10 +2,11 @@ import { useState, useRef, useEffect, useCallback, useMemo, memo } from "react";
 import {
   Play, Pause, Volume2, VolumeX, Maximize, Minimize,
   SkipForward, SkipBack, Settings, X, Lock, Unlock,
-  ChevronRight, FastForward, Rewind, Crop, Check, ExternalLink, Loader2
+  ChevronRight, FastForward, Rewind, Crop, Check, ExternalLink, Loader2, Download
 } from "lucide-react";
-import { db, ref, onValue } from "@/lib/firebase";
+import { db, ref, onValue, set, remove, update } from "@/lib/firebase";
 import { supabase } from "@/integrations/supabase/client";
+import logoImg from "@/assets/logo.png";
 
 interface QualityOption {
   label: string;
@@ -26,6 +27,7 @@ interface VideoPlayerProps {
   src: string;
   title: string;
   subtitle?: string;
+  poster?: string;
   onClose: () => void;
   onNextEpisode?: () => void;
   episodeList?: { number: number; active: boolean; onClick: () => void }[];
@@ -40,7 +42,7 @@ const formatTime = (t: number) => {
   return `${m}:${s.toString().padStart(2, "0")}`;
 };
 
-const VideoPlayer = ({ src, title, subtitle, onClose, onNextEpisode, episodeList, qualityOptions, animeId, onSaveProgress }: VideoPlayerProps) => {
+const VideoPlayer = ({ src, title, subtitle, poster, onClose, onNextEpisode, episodeList, qualityOptions, animeId, onSaveProgress }: VideoPlayerProps) => {
   const videoRef = useRef<HTMLVideoElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const videoContainerRef = useRef<HTMLDivElement>(null);
@@ -70,20 +72,89 @@ const VideoPlayer = ({ src, title, subtitle, onClose, onNextEpisode, episodeList
   const [currentQuality, setCurrentQuality] = useState<string>("Auto");
   const [currentSrc, setCurrentSrc] = useState(proxyHttpUrl(src));
   const isProxied = currentSrc.includes('/functions/v1/video-proxy');
-  const [isPremium, setIsPremium] = useState(false);
+  const [isPremium, setIsPremium] = useState<boolean | null>(null); // null = loading
   const [adGateActive, setAdGateActive] = useState(false);
   const [shortenedLink, setShortenedLink] = useState<string | null>(null);
   const [shortenLoading, setShortenLoading] = useState(false);
   const [showQualityPanel, setShowQualityPanel] = useState(false);
   const [videoError, setVideoError] = useState(false);
+  const [qualityFailMsg, setQualityFailMsg] = useState<string | null>(null);
+  const failedSrcsRef = useRef<Set<string>>(new Set());
+  const [isBuffering, setIsBuffering] = useState(true);
+  const [tutorialLink, setTutorialLink] = useState<string | null>(null);
+  const [showTutorialVideo, setShowTutorialVideo] = useState(false);
+  // Global download manager state
+  const [activeDownloads, setActiveDownloads] = useState<Map<string, any>>(new Map());
+  const [globalFreeAccess, setGlobalFreeAccess] = useState<boolean>(false);
+
+  useEffect(() => {
+    let unsub: (() => void) | undefined;
+    import("@/lib/downloadManager").then(({ downloadManager }) => {
+      unsub = downloadManager.subscribe(setActiveDownloads);
+    });
+    return () => { unsub?.(); };
+  }, []);
+
+  // Listen for global free access from Firebase
+  useEffect(() => {
+    const unsub = onValue(ref(db, "globalFreeAccess"), (snap) => {
+      const data = snap.val();
+      if (data?.active && data?.expiresAt > Date.now()) {
+        setGlobalFreeAccess(true);
+      } else {
+        setGlobalFreeAccess(false);
+      }
+    });
+    return () => unsub();
+  }, []);
+
+  // ===== VIDEO VIEW TRACKING =====
+  useEffect(() => {
+    if (!animeId) return;
+    const getUserId = (): string | null => {
+      try { const u = localStorage.getItem("rsanime_user"); if (u) return JSON.parse(u).id; } catch {} return null;
+    };
+    const uid = getUserId();
+    if (!uid) return;
+
+    // 1. Log a view count
+    const today = new Date().toISOString().split("T")[0]; // YYYY-MM-DD
+    const viewRef = ref(db, `analytics/views/${animeId}/${today}/${uid}`);
+    set(viewRef, { timestamp: Date.now(), title: title || "" }).catch(() => {});
+
+    // 2. Track as active viewer (presence)
+    const activeRef = ref(db, `analytics/activeViewers/${animeId}/${uid}`);
+    const userName = (() => {
+      try { return localStorage.getItem("rs_display_name") || JSON.parse(localStorage.getItem("rsanime_user") || "{}").name || "User"; } catch { return "User"; }
+    })();
+    set(activeRef, { title: title || "", userName, startedAt: Date.now() }).catch(() => {});
+
+    // 3. Log to daily aggregate
+    const dailyRef = ref(db, `analytics/dailyActive/${today}/${uid}`);
+    set(dailyRef, { lastSeen: Date.now(), userName }).catch(() => {});
+
+    return () => {
+      // Remove active viewer on unmount
+      remove(activeRef).catch(() => {});
+    };
+  }, [animeId, title]);
 
   // Check 24h access
   const has24hAccess = useCallback((): boolean => {
+    if (globalFreeAccess) return true;
     try {
       const expiry = localStorage.getItem("rsanime_ad_access");
       if (expiry && parseInt(expiry) > Date.now()) return true;
     } catch {}
     return false;
+  }, [globalFreeAccess]);
+
+  // Load tutorial link from Firebase
+  useEffect(() => {
+    const unsub = onValue(ref(db, "settings/tutorialLink"), (snap) => {
+      setTutorialLink(snap.val() || null);
+    });
+    return () => unsub();
   }, []);
 
   // Maintenance pause listener
@@ -125,13 +196,20 @@ const VideoPlayer = ({ src, title, subtitle, onClose, onNextEpisode, episodeList
     return () => unsub();
   }, []);
 
-  // Ad gate
+  // Ad gate - only run after premium check completes
   useEffect(() => {
+    if (isPremium === null) return; // still loading premium status
     if (isPremium || has24hAccess()) {
       setAdGateActive(false);
       return;
     }
+    // No access - block video and show ad gate
     setAdGateActive(true);
+    // Pause video immediately to prevent playing without access
+    if (videoRef.current) {
+      videoRef.current.pause();
+      videoRef.current.src = '';
+    }
     setShortenLoading(true);
     const origin = window.location.origin;
     const callbackUrl = `${origin}/unlock`;
@@ -201,20 +279,45 @@ const VideoPlayer = ({ src, title, subtitle, onClose, onNextEpisode, episodeList
   }, [src, qualityOptions]);
 
   // Update src on prop change
-  useEffect(() => { setCurrentSrc(proxyHttpUrl(src)); setCurrentQuality("Auto"); setVideoError(false); }, [src]);
+  useEffect(() => { setCurrentSrc(proxyHttpUrl(src)); setCurrentQuality("Auto"); setVideoError(false); setQualityFailMsg(null); failedSrcsRef.current.clear(); }, [src]);
 
-  // MediaSession API - show anime title in Chrome notification
+  // MediaSession API - show anime title + artwork in Chrome media notification
   useEffect(() => {
     if ('mediaSession' in navigator) {
+      const artworkSrc = (() => {
+        if (!poster) return `${window.location.origin}/favicon.ico`;
+        try {
+          return poster.startsWith("http") ? poster : new URL(poster, window.location.origin).toString();
+        } catch {
+          return `${window.location.origin}/favicon.ico`;
+        }
+      })();
+
       navigator.mediaSession.metadata = new MediaMetadata({
         title: title,
         artist: subtitle || 'RS ANIME',
         album: 'RS ANIME',
+        artwork: [
+          { src: artworkSrc, sizes: "96x96" },
+          { src: artworkSrc, sizes: "192x192" },
+          { src: artworkSrc, sizes: "384x384" },
+          { src: artworkSrc, sizes: "512x512" },
+        ],
       });
       navigator.mediaSession.setActionHandler('play', () => { videoRef.current?.play(); });
       navigator.mediaSession.setActionHandler('pause', () => { videoRef.current?.pause(); });
       navigator.mediaSession.setActionHandler('seekbackward', () => seek(-10));
       navigator.mediaSession.setActionHandler('seekforward', () => seek(10));
+      // Stop button - closes video and removes notification
+      navigator.mediaSession.setActionHandler('stop', () => {
+        if (videoRef.current) {
+          videoRef.current.pause();
+          videoRef.current.src = '';
+        }
+        navigator.mediaSession.metadata = null;
+        navigator.mediaSession.playbackState = 'none';
+        onClose();
+      });
       if (onNextEpisode) {
         navigator.mediaSession.setActionHandler('nexttrack', onNextEpisode);
       }
@@ -222,9 +325,10 @@ const VideoPlayer = ({ src, title, subtitle, onClose, onNextEpisode, episodeList
     return () => {
       if ('mediaSession' in navigator) {
         navigator.mediaSession.metadata = null;
+        navigator.mediaSession.setActionHandler('stop', null);
       }
     };
-  }, [title, subtitle, onNextEpisode]);
+  }, [title, subtitle, poster, onNextEpisode, onClose]);
 
   const resetHideTimer = useCallback(() => {
     if (hideTimer.current) clearTimeout(hideTimer.current);
@@ -242,13 +346,16 @@ const VideoPlayer = ({ src, title, subtitle, onClose, onNextEpisode, episodeList
     const v = videoRef.current;
     if (!v) return;
 
+    // Track last known good position for fallback recovery
+    let lastKnownTime = 0;
     const onLoaded = () => {
       setDuration(v.duration);
       if (pendingSeek.current !== null) {
         v.currentTime = pendingSeek.current;
         pendingSeek.current = null;
       }
-      v.play().catch(() => {});
+      // Only autoplay if ad gate is not active
+      if (!adGateActive) v.play().catch(() => {});
     };
     const onPlay = () => {
       setPlaying(true);
@@ -256,6 +363,7 @@ const VideoPlayer = ({ src, title, subtitle, onClose, onNextEpisode, episodeList
       const tick = () => {
         if (!v.paused && !v.ended) {
           const ct = v.currentTime;
+          if (ct > 0) lastKnownTime = ct;
           const dur = v.duration;
           // Direct DOM updates for progress bar - avoids React re-renders
           if (progressRef.current && dur > 0) {
@@ -280,28 +388,88 @@ const VideoPlayer = ({ src, title, subtitle, onClose, onNextEpisode, episodeList
       cancelAnimationFrame(rafId.current);
     };
     let retryCount = 0;
+    const MAX_RETRIES = 3;
     const onError = () => {
-      if (retryCount >= 2) {
+      if (retryCount >= MAX_RETRIES) {
         console.log('Video failed after retries. URL:', currentSrc);
-        setVideoError(true);
+        failedSrcsRef.current.add(currentSrc);
+        const failedQualityLabel = currentQuality;
+        
+        const nextOption = availableQualities.find(
+          (q) => !failedSrcsRef.current.has(proxyHttpUrl(q.src)) && proxyHttpUrl(q.src) !== currentSrc
+        );
+        
+        if (nextOption) {
+          setQualityFailMsg(`"${failedQualityLabel}" quality not available. Switching to "${nextOption.label}"...`);
+          setTimeout(() => setQualityFailMsg(null), 4000);
+          pendingSeek.current = lastKnownTime || v?.currentTime || 0;
+          const newFallbackSrc = proxyHttpUrl(nextOption.src);
+          if (newFallbackSrc === currentSrc) {
+            v.currentTime = pendingSeek.current;
+            pendingSeek.current = null;
+            v.load();
+          } else {
+            setCurrentSrc(newFallbackSrc);
+          }
+          setCurrentQuality(nextOption.label);
+        } else {
+          setVideoError(true);
+        }
         return;
       }
       retryCount++;
-      console.log(`Video error, retry ${retryCount}/2...`);
+      console.log(`Video error, retry ${retryCount}/${MAX_RETRIES}...`);
+      // Exponential backoff: 500ms, 1000ms, 1500ms
+      const delay = retryCount * 500;
       setTimeout(() => {
         if (v) {
-          const savedTime = v.currentTime;
+          const savedTime = v.currentTime || lastKnownTime;
+          // For MKV files, try removing the src attribute and re-setting it
+          v.src = currentSrc;
           v.load();
           v.addEventListener('loadedmetadata', () => {
             if (savedTime > 0) v.currentTime = savedTime;
             v.play().catch(() => {});
           }, { once: true });
+          // Also listen for canplay as fallback for MKV
+          v.addEventListener('canplay', () => {
+            if (savedTime > 0 && Math.abs(v.currentTime - savedTime) > 2) {
+              v.currentTime = savedTime;
+            }
+            v.play().catch(() => {});
+          }, { once: true });
         }
-      }, 1500);
+      }, delay);
     };
     const onCanPlay = () => {
       setVideoError(false);
-      if (v.paused) v.play().catch(() => {});
+      setIsBuffering(false);
+      // Also apply pending seek here in case loadedmetadata didn't fire
+      if (pendingSeek.current !== null && v.duration > 0) {
+        v.currentTime = pendingSeek.current;
+        pendingSeek.current = null;
+      }
+      if (v.paused && !adGateActive) v.play().catch(() => {});
+    };
+    const onCanPlayThrough = () => {
+      setIsBuffering(false);
+    };
+    // Debounce waiting to avoid flashing loader on brief buffers
+    let waitingTimer: ReturnType<typeof setTimeout> | null = null;
+    const onWaiting = () => {
+      if (waitingTimer) clearTimeout(waitingTimer);
+      waitingTimer = setTimeout(() => setIsBuffering(true), 300);
+    };
+    const onPlaying = () => {
+      if (waitingTimer) { clearTimeout(waitingTimer); waitingTimer = null; }
+      setIsBuffering(false);
+    };
+    const onSeeked = () => {
+      // Only clear buffering if video has enough data to play
+      if (v.readyState >= 3) {
+        if (waitingTimer) { clearTimeout(waitingTimer); waitingTimer = null; }
+        setIsBuffering(false);
+      }
     };
 
     v.addEventListener("loadedmetadata", onLoaded);
@@ -310,6 +478,11 @@ const VideoPlayer = ({ src, title, subtitle, onClose, onNextEpisode, episodeList
     v.addEventListener("ended", onEnded);
     v.addEventListener("error", onError);
     v.addEventListener("canplay", onCanPlay);
+    v.addEventListener("canplaythrough", onCanPlayThrough);
+    v.addEventListener("waiting", onWaiting);
+    v.addEventListener("playing", onPlaying);
+    v.addEventListener("seeked", onSeeked);
+    setIsBuffering(true);
     v.load();
 
     return () => {
@@ -320,8 +493,12 @@ const VideoPlayer = ({ src, title, subtitle, onClose, onNextEpisode, episodeList
       v.removeEventListener("ended", onEnded);
       v.removeEventListener("error", onError);
       v.removeEventListener("canplay", onCanPlay);
+      v.removeEventListener("canplaythrough", onCanPlayThrough);
+      v.removeEventListener("waiting", onWaiting);
+      v.removeEventListener("playing", onPlaying);
+      v.removeEventListener("seeked", onSeeked);
     };
-  }, [currentSrc]);
+  }, [currentSrc, adGateActive]);
 
   useEffect(() => {
     const onFs = () => setIsFullscreen(!!document.fullscreenElement);
@@ -363,12 +540,20 @@ const VideoPlayer = ({ src, title, subtitle, onClose, onNextEpisode, episodeList
 
   const switchQuality = useCallback((option: QualityOption) => {
     if (option.label === currentQuality) { setShowSettings(false); return; }
+    const newSrc = proxyHttpUrl(option.src);
+    // If same URL (e.g. Auto and 4K share same link), just update label - no reload
+    if (newSrc === currentSrc) {
+      setCurrentQuality(option.label);
+      setShowSettings(false);
+      return;
+    }
     const v = videoRef.current;
     pendingSeek.current = v?.currentTime || 0;
-    setCurrentSrc(proxyHttpUrl(option.src));
+    setIsBuffering(true);
+    setCurrentSrc(newSrc);
     setCurrentQuality(option.label);
     setShowSettings(false);
-  }, [currentQuality]);
+  }, [currentQuality, currentSrc]);
 
   const handleProgressClick = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
     const v = videoRef.current;
@@ -478,7 +663,11 @@ const VideoPlayer = ({ src, title, subtitle, onClose, onNextEpisode, episodeList
             playsInline
             preload="auto"
             {...(isProxied ? { crossOrigin: "anonymous" } : {})}
-          />
+          >
+            {/* MKV/MP4 codec hints for better browser compatibility */}
+            <source src={currentSrc} type={currentSrc.toLowerCase().endsWith('.mkv') ? 'video/x-matroska' : 'video/mp4'} />
+            <source src={currentSrc} type="video/webm" />
+          </video>
 
           {/* Video Error Overlay */}
           {videoError && (
@@ -488,9 +677,73 @@ const VideoPlayer = ({ src, title, subtitle, onClose, onNextEpisode, episodeList
               </div>
               <p className="text-base font-semibold text-foreground mb-1">Video Unavailable</p>
               <p className="text-xs text-muted-foreground mb-4 text-center px-6">Server is not responding. Try another episode or quality.</p>
-              <button onClick={(e) => { e.stopPropagation(); setVideoError(false); const v = videoRef.current; if (v) { v.load(); } }} className="px-4 py-2 rounded-lg gradient-primary text-sm font-semibold btn-glow">
+              <button onClick={(e) => { e.stopPropagation(); setVideoError(false); setIsBuffering(true); const v = videoRef.current; if (v) { v.load(); } }} className="px-4 py-2 rounded-lg gradient-primary text-sm font-semibold btn-glow">
                 Retry
               </button>
+            </div>
+          )}
+
+          {/* Loading/Buffering Overlay */}
+          {isBuffering && !videoError && (
+            <div className="absolute inset-0 flex items-center justify-center bg-black/70 z-15 pointer-events-none">
+              <div className="flex flex-col items-center gap-2">
+                {/* Anime TV with logo */}
+                <div className="relative" style={{ width: 72, height: 64 }}>
+                  <svg viewBox="0 0 64 56" width="72" height="64" fill="none">
+                    {/* Antenna */}
+                    <line x1="24" y1="8" x2="32" y2="0" stroke="hsl(var(--primary))" strokeWidth="2" strokeLinecap="round"/>
+                    <line x1="40" y1="8" x2="32" y2="0" stroke="hsl(var(--primary))" strokeWidth="2" strokeLinecap="round"/>
+                    <circle cx="32" cy="0" r="2" fill="hsl(var(--accent))">
+                      <animate attributeName="fill-opacity" values="1;0.4;1" dur="1s" repeatCount="indefinite"/>
+                    </circle>
+                    {/* TV frame */}
+                    <rect x="6" y="8" width="52" height="38" rx="6" fill="hsl(var(--card))" stroke="hsl(var(--primary))" strokeWidth="2"/>
+                    {/* Screen bg */}
+                    <rect x="10" y="12" width="44" height="30" rx="3" fill="hsl(var(--background))"/>
+                    {/* Glow ring */}
+                    <rect x="4" y="6" width="56" height="42" rx="8" fill="none" stroke="hsl(var(--primary))" strokeWidth="1" opacity="0.4">
+                      <animate attributeName="opacity" values="0.2;0.6;0.2" dur="2s" repeatCount="indefinite"/>
+                    </rect>
+                    {/* TV legs */}
+                    <line x1="22" y1="46" x2="18" y2="54" stroke="hsl(var(--primary))" strokeWidth="2" strokeLinecap="round"/>
+                    <line x1="42" y1="46" x2="46" y2="54" stroke="hsl(var(--primary))" strokeWidth="2" strokeLinecap="round"/>
+                  </svg>
+                  {/* Logo inside TV screen - using fixed pixel positioning */}
+                  <img 
+                    src={logoImg} 
+                    alt="Logo" 
+                    className="absolute animate-pulse"
+                    style={{ top: 16, left: 14, width: 44, height: 28, objectFit: 'contain' }}
+                  />
+                </div>
+
+                {/* Running anime character */}
+                <div className="relative w-24 h-6 overflow-hidden">
+                  <div className="absolute animate-[runAcross_2s_linear_infinite] flex items-end">
+                    <svg viewBox="0 0 24 24" className="w-5 h-5" fill="none">
+                      {/* Stick figure running */}
+                      <circle cx="12" cy="4" r="3" fill="hsl(var(--accent))"/>
+                      <path d="M12 7 L12 14 M12 10 L8 13 M12 10 L16 8 M12 14 L8 19 M12 14 L16 19" stroke="hsl(var(--accent))" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+                        <animate attributeName="d" values="M12 7 L12 14 M12 10 L8 13 M12 10 L16 8 M12 14 L8 19 M12 14 L16 19;M12 7 L12 14 M12 10 L16 13 M12 10 L8 8 M12 14 L16 19 M12 14 L8 19;M12 7 L12 14 M12 10 L8 13 M12 10 L16 8 M12 14 L8 19 M12 14 L16 19" dur="0.4s" repeatCount="indefinite"/>
+                      </path>
+                    </svg>
+                  </div>
+                  {/* Dust particles */}
+                  <div className="absolute bottom-0 left-0 w-full h-[1px] bg-gradient-to-r from-transparent via-primary/30 to-transparent"/>
+                </div>
+
+                {/* Loading text with dots animation */}
+                <p className="text-sm font-semibold tracking-widest" style={{ fontFamily: "'Rajdhani', sans-serif" }}>
+                  <span className="text-primary">L</span>
+                  <span className="text-accent">O</span>
+                  <span className="text-primary">A</span>
+                  <span className="text-accent">D</span>
+                  <span className="text-primary">I</span>
+                  <span className="text-accent">N</span>
+                  <span className="text-primary">G</span>
+                  <span className="animate-pulse text-accent">...</span>
+                </p>
+              </div>
             </div>
           )}
 
@@ -506,7 +759,13 @@ const VideoPlayer = ({ src, title, subtitle, onClose, onNextEpisode, episodeList
             </div>
           )}
 
-          {/* Swipe indicator */}
+          {/* Quality fallback message */}
+          {qualityFailMsg && (
+            <div className="absolute top-4 left-1/2 -translate-x-1/2 z-30 player-glass px-4 py-2.5 rounded-xl text-center max-w-[85%] animate-in fade-in slide-in-from-top-2 duration-300">
+              <p className="text-xs font-semibold text-accent">⚠ {qualityFailMsg}</p>
+            </div>
+          )}
+
           {swipeState?.type && (
             <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 player-glass px-6 py-3 rounded-xl text-center">
               {swipeState.type === "volume" ? (
@@ -691,13 +950,138 @@ const VideoPlayer = ({ src, title, subtitle, onClose, onNextEpisode, episodeList
                   Unlock Now
                 </button>
               )}
+              <button
+                onClick={() => {
+                  if (tutorialLink) {
+                    setShowTutorialVideo(true);
+                  } else {
+                    alert("Tutorial video not available yet. Please contact admin.");
+                  }
+                }}
+                className="w-full py-2.5 rounded-xl bg-secondary text-secondary-foreground font-medium flex items-center justify-center gap-2 transition-all hover:scale-105 text-sm"
+              >
+                <Play className="w-3.5 h-3.5" />
+                How to open my link
+              </button>
             </div>
           </div>
         )}
 
+        {/* Tutorial Video Modal */}
+        {showTutorialVideo && tutorialLink && (
+          <div className="fixed inset-0 z-[500] bg-black/95 flex items-center justify-center backdrop-blur-sm" onClick={() => setShowTutorialVideo(false)}>
+            <div className="w-full max-w-xs mx-4" onClick={(e) => e.stopPropagation()}>
+              <div className="flex justify-between items-center mb-3">
+                <h3 className="text-sm font-semibold text-foreground">📖 How to open my link</h3>
+                <button onClick={() => setShowTutorialVideo(false)} className="w-8 h-8 rounded-full bg-foreground/20 flex items-center justify-center hover:bg-foreground/30 transition-all">
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+              <div className="relative w-full rounded-xl overflow-hidden bg-black" style={{ aspectRatio: '9/16' }}>
+                <video
+                  src={proxyHttpUrl(tutorialLink)}
+                  className="w-full h-full"
+                  controls
+                  autoPlay
+                  playsInline
+                  style={{ objectFit: 'contain' }}
+                  crossOrigin={tutorialLink.startsWith("http://") ? "anonymous" : undefined}
+                />
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Download Button with Progress */}
+        {!isFullscreen && !adGateActive && (() => {
+          const normalizeKeyPart = (value: string) =>
+            value
+              .toLowerCase()
+              .replace(/[^a-z0-9]+/g, "_")
+              .replace(/^_+|_+$/g, "");
+
+          const createUrlHash = (value: string) => {
+            let hash = 0;
+            for (let i = 0; i < value.length; i++) {
+              hash = (hash * 31 + value.charCodeAt(i)) >>> 0;
+            }
+            return hash.toString(36);
+          };
+
+          const createDownloadId = (videoTitle: string, videoSubtitle: string | undefined, quality: string, url: string) => {
+            const base = [videoTitle, videoSubtitle].filter(Boolean).map((part) => normalizeKeyPart(part as string)).join("__") || "video";
+            const qualityPart = normalizeKeyPart(quality || "Auto") || "auto";
+            return `${base}__${qualityPart}__${createUrlHash(url)}`;
+          };
+
+          const relatedDownloads = Array.from(activeDownloads.values()).filter((item: any) => (
+            item.title === title && (!subtitle || item.subtitle === subtitle)
+          ));
+
+          const dl = relatedDownloads.find((item: any) => item.status === "downloading")
+            ?? relatedDownloads.find((item: any) => item.status === "complete");
+
+          const isDownloading = dl?.status === "downloading";
+          const isComplete = dl?.status === "complete";
+          const downloadId = createDownloadId(title, subtitle, currentQuality, currentSrc);
+
+          return (
+            <div className="mt-5 w-full max-w-md mx-auto">
+              <button
+                onClick={async () => {
+                  if (isDownloading || isComplete) return;
+                  const { downloadManager } = await import("@/lib/downloadManager");
+                  downloadManager.startDownload({
+                    id: downloadId,
+                    url: currentSrc,
+                    title,
+                    subtitle,
+                    poster,
+                    quality: currentQuality,
+                  });
+                  const { toast } = await import("sonner");
+                  toast.info("Download started");
+                }}
+                disabled={isDownloading || isComplete}
+                className={`relative w-full py-3 rounded-xl font-semibold flex items-center justify-center gap-2 transition-all overflow-hidden ${
+                  isComplete
+                    ? "bg-primary text-primary-foreground"
+                    : isDownloading
+                      ? "bg-secondary text-foreground border border-primary/30"
+                      : "gradient-primary text-primary-foreground btn-glow hover:scale-[1.02]"
+                }`}
+              >
+                {/* Animated fill background */}
+                {isDownloading && dl && (
+                  <div
+                    className="absolute inset-0 gradient-primary opacity-80 transition-all duration-300 ease-linear"
+                    style={{ width: `${dl.percent}%` }}
+                  />
+                )}
+                <span className="relative z-10 flex items-center gap-2">
+                  {isComplete ? (
+                    <><Check className="w-4 h-4" /> Downloaded</>
+                  ) : isDownloading && dl ? (
+                    <>
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                      <span className="font-mono">{dl.percent}%</span>
+                      <span className="text-xs opacity-80">
+                        {dl.loadedMB.toFixed(1)}/{dl.totalMB > 0 ? dl.totalMB.toFixed(1) : "??"} MB
+                      </span>
+                      {dl.quality !== "Auto" && <span className="text-[10px] opacity-80">• {dl.quality}</span>}
+                    </>
+                  ) : (
+                    <><Download className="w-4 h-4" /> Download Episode</>
+                  )}
+                </span>
+              </button>
+            </div>
+          );
+        })()}
+
         {/* Episode List */}
         {episodeList && episodeList.length > 0 && (
-          <div className="mt-5 bg-background rounded-xl p-4 max-h-[300px] overflow-y-auto">
+          <div className="mt-4 bg-background rounded-xl p-4 max-h-[300px] overflow-y-auto">
             <h3 className="text-base font-semibold mb-3 text-center">Episodes</h3>
             <div className="grid grid-cols-3 gap-2">
               {episodeList.map((ep) => (
