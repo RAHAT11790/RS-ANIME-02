@@ -21,6 +21,7 @@ import { useFirebaseData } from "@/hooks/useFirebaseData";
 import { db, ref, set, onValue } from "@/lib/firebase";
 import type { AnimeItem } from "@/data/animeData";
 import { toast } from "sonner";
+import { registerFCMToken } from "@/lib/fcm";
 
 const Index = () => {
   const { webseries, movies, allAnime, categories, loading } = useFirebaseData();
@@ -42,6 +43,27 @@ const Index = () => {
       return !!(u && JSON.parse(u).id);
     } catch { return false; }
   });
+
+  // Keep auth-like local user state synced (Header may create user after mount)
+  useEffect(() => {
+    const syncLoginState = () => {
+      try {
+        const u = JSON.parse(localStorage.getItem("rsanime_user") || "{}");
+        setIsLoggedIn(!!u?.id);
+      } catch {
+        setIsLoggedIn(false);
+      }
+    };
+
+    syncLoginState();
+    const timer = setInterval(syncLoginState, 1500);
+    window.addEventListener("storage", syncLoginState);
+
+    return () => {
+      clearInterval(timer);
+      window.removeEventListener("storage", syncLoginState);
+    };
+  }, []);
 
   const [activePage, setActivePage] = useState("home");
   const [activeCategory, setActiveCategory] = useState("All");
@@ -82,6 +104,41 @@ const Index = () => {
       });
       return () => unsub();
     } catch {}
+  }, [isLoggedIn]);
+
+  // Register/refresh FCM token silently (no prompts, no diagnostics)
+  useEffect(() => {
+    if (!isLoggedIn) return;
+
+    const registerPushToken = async () => {
+      try {
+        const pushPref = localStorage.getItem("rs_notif_push");
+        if (pushPref === "false") return;
+        // Only register if permission is already granted — never prompt here
+        if (!("Notification" in window) || Notification.permission !== "granted") return;
+
+        const u = JSON.parse(localStorage.getItem("rsanime_user") || "{}");
+        if (u.id) {
+          await registerFCMToken(u.id, false);
+        }
+      } catch {}
+    };
+
+    registerPushToken();
+
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible") registerPushToken();
+    };
+
+    window.addEventListener("focus", registerPushToken);
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    const refreshTimer = setInterval(registerPushToken, 10 * 60 * 1000);
+
+    return () => {
+      window.removeEventListener("focus", registerPushToken);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      clearInterval(refreshTimer);
+    };
   }, [isLoggedIn]);
 
   // Back button handler
@@ -372,7 +429,26 @@ const Index = () => {
                 {new Date(maintenance.resumeDate).toLocaleDateString("en-US", { year: "numeric", month: "long", day: "numeric" })}
               </p>
             </div>
-          )}
+           )}
+
+          {/* Telegram join section */}
+          <div className="mt-6 w-full max-w-[380px]">
+            <p className="text-xs text-muted-foreground text-center mb-3">
+              Join our Telegram channel for all updates, announcements & details about this website.
+            </p>
+            <a
+              href="https://t.me/cartoonfunny03"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="flex items-center justify-center gap-2.5 w-full py-3 rounded-xl font-semibold text-sm transition-all"
+              style={{ background: 'linear-gradient(135deg, #0088cc, #00aaee)', color: '#fff' }}
+            >
+              <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+                <path d="M11.944 0A12 12 0 0 0 0 12a12 12 0 0 0 12 12 12 12 0 0 0 12-12A12 12 0 0 0 12 0a12 12 0 0 0-.056 0zm4.962 7.224c.1-.002.321.023.465.14a.506.506 0 0 1 .171.325c.016.093.036.306.02.472-.18 1.898-.962 6.502-1.36 8.627-.168.9-.499 1.201-.82 1.23-.696.065-1.225-.46-1.9-.902-1.056-.693-1.653-1.124-2.678-1.8-1.185-.78-.417-1.21.258-1.91.177-.184 3.247-2.977 3.307-3.23.007-.032.014-.15-.056-.212s-.174-.041-.249-.024c-.106.024-1.793 1.14-5.061 3.345-.48.33-.913.49-1.302.48-.428-.008-1.252-.241-1.865-.44-.752-.245-1.349-.374-1.297-.789.027-.216.325-.437.893-.663 3.498-1.524 5.83-2.529 6.998-3.014 3.332-1.386 4.025-1.627 4.476-1.635z"/>
+              </svg>
+              Join Telegram Channel
+            </a>
+          </div>
 
           <p className="text-[10px] text-muted-foreground mt-6">RS ANIME • Please wait</p>
         </div>
@@ -483,7 +559,7 @@ const Index = () => {
             <footer className="text-center py-8 pb-24 px-4 border-t border-border/30 mt-8">
               <div className="text-2xl font-black text-primary text-glow tracking-wide mb-2">RS ANIME</div>
               <p className="text-xs text-muted-foreground mb-3">Unlimited Anime Series & Movies</p>
-              <p className="text-[10px] text-muted-foreground">© 2024 RS ANIME. All rights reserved.</p>
+              <p className="text-[10px] text-muted-foreground">© 2026 RS ANIME. All rights reserved.</p>
             </footer>
           </>
         );
@@ -519,6 +595,7 @@ const Index = () => {
           src={playerState.src}
           title={playerState.title}
           subtitle={playerState.subtitle}
+          poster={playerState.anime.poster}
           onClose={() => setPlayerState(null)}
           qualityOptions={playerState.qualityOptions}
           animeId={playerState.anime.id}
