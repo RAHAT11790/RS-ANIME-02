@@ -1,19 +1,20 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { db, ref, onValue, push, set, remove, update, get, auth, signInWithEmailAndPassword, signOut } from "@/lib/firebase";
+import { sendPushToUsers, type PushProgress } from "@/lib/fcm";
 import { toast } from "sonner";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   LayoutDashboard, FolderOpen, Film, Video, Users, Bell, Zap, PlusCircle, CloudDownload,
   Menu, X, MoreVertical, RefreshCw, Plus, Download, Trash2, Edit, Eye, EyeOff,
   Shield, LogOut, Search, Save, ChevronDown, Send, Link, ChevronLeft, ChevronRight,
-  Lock, KeyRound, AlertTriangle, Power
+  Lock, KeyRound, AlertTriangle, Power, Settings, MessageCircle, Reply, BarChart3, Activity, TrendingUp
 } from "lucide-react";
 
 const TMDB_API_KEY = "37f4b185e3dc487e4fd3e56e2fab2307";
 const TMDB_BASE_URL = "https://api.themoviedb.org/3";
 const TMDB_IMG_BASE = "https://image.tmdb.org/t/p/";
 
-type Section = "dashboard" | "categories" | "webseries" | "movies" | "users" | "notifications" | "new-releases" | "tmdb-fetch" | "add-content" | "redeem-codes" | "maintenance" | "free-access";
+type Section = "dashboard" | "categories" | "webseries" | "movies" | "users" | "notifications" | "new-releases" | "tmdb-fetch" | "add-content" | "redeem-codes" | "maintenance" | "free-access" | "settings" | "comments" | "analytics";
 
 interface CastMember {
   name: string;
@@ -63,6 +64,7 @@ const Admin = () => {
   const [usersData, setUsersData] = useState<any[]>([]);
   const [notificationsData, setNotificationsData] = useState<any[]>([]);
   const [releasesData, setReleasesData] = useState<any[]>([]);
+  const [commentsData, setCommentsData] = useState<any[]>([]);
 
   // Form states
   const [categoryInput, setCategoryInput] = useState("");
@@ -84,6 +86,8 @@ const Admin = () => {
   const [movieCast, setMovieCast] = useState<CastMember[]>([]);
   const [movieSearch, setMovieSearch] = useState("");
   const [movieResults, setMovieResults] = useState<any[]>([]);
+  const [wsListSearch, setWsListSearch] = useState("");
+  const [mvListSearch, setMvListSearch] = useState("");
   const [movieEditId, setMovieEditId] = useState("");
 
   // Notification form
@@ -92,7 +96,11 @@ const Admin = () => {
   const [notifContent, setNotifContent] = useState("");
   const [notifType, setNotifType] = useState("info");
   const [notifTarget, setNotifTarget] = useState("all");
-  const [contentOptions, setContentOptions] = useState<{ value: string; label: string }[]>([]);
+  const [contentOptions, setContentOptions] = useState<{ value: string; label: string; poster: string }[]>([]);
+  const [notifDropdownOpen, setNotifDropdownOpen] = useState(false);
+  const [releaseDropdownOpen, setReleaseDropdownOpen] = useState(false);
+  const notifDropdownRef = useRef<HTMLDivElement>(null);
+  const releaseDropdownRef = useRef<HTMLDivElement>(null);
 
   // New release form
   const [releaseContent, setReleaseContent] = useState("");
@@ -110,11 +118,34 @@ const Admin = () => {
   // Free access users state
   const [freeAccessUsers, setFreeAccessUsers] = useState<any[]>([]);
 
+  // Settings state
+  const [tutorialLink, setTutorialLink] = useState("");
+  const [tutorialLinkInput, setTutorialLinkInput] = useState("");
+
   // Maintenance state
   const [maintenanceActive, setMaintenanceActive] = useState(false);
   const [maintenanceMessage, setMaintenanceMessage] = useState("Server is under maintenance. Please wait.");
   const [maintenanceResumeDate, setMaintenanceResumeDate] = useState("");
   const [currentMaintenance, setCurrentMaintenance] = useState<any>(null);
+
+  // Global free access state
+  const [globalFreeAccess, setGlobalFreeAccess] = useState<any>(null);
+  const [globalFreeHours, setGlobalFreeHours] = useState("2");
+  const [globalFreeMinutes, setGlobalFreeMinutes] = useState("0");
+
+  // Analytics state
+  const [analyticsViews, setAnalyticsViews] = useState<Record<string, any>>({});
+  const [activeViewers, setActiveViewers] = useState<Record<string, any>>({});
+  const [dailyActiveUsers, setDailyActiveUsers] = useState<Record<string, any>>({});
+
+  // Push progress state
+  const [pushProgress, setPushProgress] = useState<PushProgress | null>(null);
+  const [pushSending, setPushSending] = useState(false);
+  const [fcmTokenStats, setFcmTokenStats] = useState<{ totalTokens: number; totalUsers: number; lastUpdated: number }>({
+    totalTokens: 0,
+    totalUsers: 0,
+    lastUpdated: 0,
+  });
 
   // Expanded episodes
   const [expandedSeasons, setExpandedSeasons] = useState<Record<number, boolean>>({});
@@ -179,6 +210,19 @@ const Admin = () => {
       setUsersData(Object.entries(data).map(([id, user]: any) => ({ id, ...user })));
     }));
 
+    unsubs.push(onValue(ref(db, "fcmTokens"), (snap) => {
+      const data = snap.val() || {};
+      let totalTokens = 0;
+      Object.values(data).forEach((userTokens: any) => {
+        totalTokens += Object.keys(userTokens || {}).length;
+      });
+      setFcmTokenStats({
+        totalTokens,
+        totalUsers: Object.keys(data).length,
+        lastUpdated: Date.now(),
+      });
+    }));
+
     unsubs.push(onValue(ref(db, "notifications"), (snap) => {
       const data = snap.val() || {};
       const allNotifs: any[] = [];
@@ -225,16 +269,66 @@ const Admin = () => {
       setFreeAccessUsers(activeUsers);
     }));
 
+    unsubs.push(onValue(ref(db, "globalFreeAccess"), (snap) => {
+      setGlobalFreeAccess(snap.val() || null);
+    }));
+
+    unsubs.push(onValue(ref(db, "settings/tutorialLink"), (snap) => {
+      const val = snap.val() || "";
+      setTutorialLink(val);
+      setTutorialLinkInput(val);
+    }));
+
+    // Load all comments
+    unsubs.push(onValue(ref(db, "comments"), (snap) => {
+      const data = snap.val() || {};
+      const allComments: any[] = [];
+      Object.entries(data).forEach(([animeId, comments]: any) => {
+        Object.entries(comments || {}).forEach(([commentId, comment]: any) => {
+          const replies = comment.replies ? Object.entries(comment.replies).map(([rId, r]: any) => ({
+            id: rId, ...r
+          })) : [];
+          allComments.push({
+            id: commentId, animeId, ...comment, replies,
+          });
+        });
+      });
+      allComments.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+      setCommentsData(allComments);
+    }));
+    // Load analytics data
+    unsubs.push(onValue(ref(db, "analytics/views"), (snap) => {
+      setAnalyticsViews(snap.val() || {});
+    }));
+    unsubs.push(onValue(ref(db, "analytics/activeViewers"), (snap) => {
+      setActiveViewers(snap.val() || {});
+    }));
+    unsubs.push(onValue(ref(db, "analytics/dailyActive"), (snap) => {
+      setDailyActiveUsers(snap.val() || {});
+    }));
+
     return () => unsubs.forEach(u => u());
   }, []);
 
-  // Build content options for notifications/releases
+  // Build content options for notifications/releases (newest first by createdAt)
   useEffect(() => {
-    const options: { value: string; label: string }[] = [];
-    webseriesData.forEach(s => options.push({ value: `${s.id}|webseries`, label: `Series: ${s.title}` }));
-    moviesData.forEach(m => options.push({ value: `${m.id}|movie`, label: `Movie: ${m.title}` }));
+    const options: { value: string; label: string; poster: string; createdAt: number }[] = [];
+    webseriesData.forEach(s => options.push({ value: `${s.id}|webseries`, label: `Series: ${s.title}`, poster: s.poster || "", createdAt: s.createdAt || 0 }));
+    moviesData.forEach(m => options.push({ value: `${m.id}|movie`, label: `Movie: ${m.title}`, poster: m.poster || "", createdAt: m.createdAt || 0 }));
+    // Sort by createdAt descending so newest added items appear first
+    options.sort((a, b) => b.createdAt - a.createdAt);
     setContentOptions(options);
   }, [webseriesData, moviesData]);
+
+  // Close dropdowns on outside click
+  useEffect(() => {
+    const handleClick = (e: MouseEvent) => {
+      if (notifDropdownRef.current && !notifDropdownRef.current.contains(e.target as Node)) setNotifDropdownOpen(false);
+      if (releaseDropdownRef.current && !releaseDropdownRef.current.contains(e.target as Node)) setReleaseDropdownOpen(false);
+    };
+    document.addEventListener("mousedown", handleClick);
+    return () => document.removeEventListener("mousedown", handleClick);
+  }, []);
 
   const showSection = (section: Section) => {
     setActiveSection(section);
@@ -265,6 +359,9 @@ const Admin = () => {
     "redeem-codes": "Redeem Codes",
     maintenance: "Server Maintenance",
     "free-access": "Free Access Users",
+    settings: "Settings",
+    comments: "Comments",
+    analytics: "Analytics & Views",
   };
 
   // ==================== CATEGORIES ====================
@@ -309,6 +406,21 @@ const Admin = () => {
   };
 
   const fetchSeriesDetails = async (id: number) => {
+    // Check if this TMDB ID already exists
+    const existing = webseriesData.find(s => s.tmdbId === id || s.tmdbId === String(id));
+    if (existing) {
+      toast.warning(`"${existing.title}" আগে থেকেই আছে!`, { duration: 5000 });
+      // On second click (confirm), load existing data for editing
+      if (seriesForm?.tmdbId === id || seriesForm?.tmdbId === String(id)) {
+        editSeries(existing.id);
+        setSeriesResults([]);
+        return;
+      }
+      // Set form with TMDB ID so next click loads existing
+      setSeriesForm({ tmdbId: id });
+      return;
+    }
+
     setFetchingOverlay(true);
     try {
       const res = await fetch(`${TMDB_BASE_URL}/tv/${id}?api_key=${TMDB_API_KEY}&append_to_response=credits,videos,images`);
@@ -415,6 +527,21 @@ const Admin = () => {
   };
 
   const fetchMovieDetails = async (id: number) => {
+    // Check if this TMDB ID already exists
+    const existing = moviesData.find(m => m.tmdbId === id || m.tmdbId === String(id));
+    if (existing) {
+      toast.warning(`"${existing.title}" আগে থেকেই আছে!`, { duration: 5000 });
+      // On second click (confirm), load existing data for editing
+      if (movieForm?.tmdbId === id || movieForm?.tmdbId === String(id)) {
+        editMovie(existing.id);
+        setMovieResults([]);
+        return;
+      }
+      // Set form with TMDB ID so next click loads existing
+      setMovieForm({ tmdbId: id });
+      return;
+    }
+
     setFetchingOverlay(true);
     try {
       const res = await fetch(`${TMDB_BASE_URL}/movie/${id}?api_key=${TMDB_API_KEY}&append_to_response=credits,videos,images`);
@@ -497,37 +624,111 @@ const Admin = () => {
   // ==================== NOTIFICATIONS ====================
   const sendNotification = async () => {
     if (!notifTitle || !notifMessage) { toast.error("Please enter title and message"); return; }
-    setFetchingOverlay(true);
+    const savedTitle = notifTitle;
+    const savedMessage = notifMessage;
+
+    setPushSending(true);
+    setPushProgress({ phase: "tokens", totalTokens: 0, sent: 0, success: 0, failed: 0, invalidRemoved: 0 });
+
     try {
-      let contentId = "", contentType = "";
+      let contentId = "", contentType = "", contentPoster = "";
       if (notifContent) {
         const parts = notifContent.split("|");
         contentId = parts[0]; contentType = parts[1];
+        contentPoster = contentOptions.find((o) => o.value === notifContent)?.poster || "";
       }
+
       const usersSnap = await get(ref(db, "users"));
       const users = usersSnap.val() || {};
-      const promises: any[] = [];
-      let userCount = 0;
-      Object.entries(users).forEach(([userId, userData]: any) => {
-        if (notifTarget === "online" && !userData.online) return;
-        userCount++;
-        promises.push(push(ref(db, `notifications/${userId}`), {
-          title: notifTitle, message: notifMessage, type: notifType, contentId, contentType,
-          timestamp: Date.now(), read: false
-        }));
+      const targetUserIds: string[] = [];
+      const userNotifUpdates: Record<string, any> = {};
+      const seenUserIds = new Set<string>();
+
+      Object.entries(users).forEach(([userKey, userData]: any) => {
+        const effectiveUserId = String(userData?.id || userKey || "").trim();
+        if (!effectiveUserId || seenUserIds.has(effectiveUserId)) return;
+        if (notifTarget === "online" && !userData?.online) return;
+
+        seenUserIds.add(effectiveUserId);
+        targetUserIds.push(effectiveUserId);
+
+        const notifKey = push(ref(db, `notifications/${effectiveUserId}`)).key;
+        if (!notifKey) return;
+
+        userNotifUpdates[`notifications/${effectiveUserId}/${notifKey}`] = {
+          title: savedTitle,
+          message: savedMessage,
+          type: notifType,
+          contentId,
+          contentType,
+          image: contentPoster,
+          poster: contentPoster,
+          timestamp: Date.now(),
+          read: false,
+        };
       });
-      await Promise.all(promises);
-      toast.success(`Notification sent to ${userCount} users`);
-      setNotifTitle(""); setNotifMessage("");
-    } catch (err: any) { toast.error("Error: " + err.message); }
-    finally { setFetchingOverlay(false); }
+
+      if (Object.keys(userNotifUpdates).length > 0) {
+        await update(ref(db), userNotifUpdates);
+      }
+      toast.success(`In-app notification sent to ${targetUserIds.length} users`);
+      setNotifTitle("");
+      setNotifMessage("");
+
+      if (targetUserIds.length === 0) {
+        setPushSending(false); setPushProgress(null);
+        return;
+      }
+
+      const pushPayload = {
+        title: savedTitle || "RS ANIME",
+        body: savedMessage,
+        image: contentPoster || undefined,
+        url: contentId ? `/?anime=${contentId}` : "/",
+        data: { url: contentId ? `/?anime=${contentId}` : "/", type: notifType || "info", contentId },
+      };
+
+      const result = await sendPushToUsers(targetUserIds, pushPayload, (p) => setPushProgress({ ...p }));
+      console.log("FCM result:", result);
+      if ((result?.total || 0) === 0) {
+        const reason = result?.reason ? ` [${result.reason}]` : "";
+        toast.warning(`Push token পাওয়া যায়নি${reason} — শুধু in-app notification গেছে`);
+      } else {
+        toast.success(`Push: ${result?.success || 0} delivered, ${result?.failed || 0} failed`);
+      }
+    } catch (err: any) {
+      console.warn("Notification send failed:", err);
+      toast.error("Error: " + err.message);
+    } finally {
+      setTimeout(() => { setPushSending(false); setPushProgress(null); }, 6000);
+    }
   };
 
-  const deleteNotification = (userId: string, notifId: string) => {
-    if (confirm("Delete this notification?")) {
-      remove(ref(db, `notifications/${userId}/${notifId}`))
-        .then(() => toast.success("Notification deleted"))
-        .catch(() => toast.error("Error deleting notification"));
+  const deleteNotification = async (title: string, message: string, timestamp: number) => {
+    if (!confirm("Delete this notification for all users?")) return;
+    try {
+      const snap = await get(ref(db, "notifications"));
+      const allData = snap.val() || {};
+      const deleteUpdates: Record<string, null> = {};
+
+      Object.entries(allData).forEach(([uid, userNotifs]: any) => {
+        Object.entries(userNotifs || {}).forEach(([nid, notif]: any) => {
+          if (notif.title === title && notif.message === message) {
+            deleteUpdates[`notifications/${uid}/${nid}`] = null;
+          }
+        });
+      });
+
+      const deleteCount = Object.keys(deleteUpdates).length;
+      if (deleteCount > 0) {
+        await update(ref(db), deleteUpdates);
+        toast.success(`Deleted ${deleteCount} notifications`);
+      } else {
+        toast.error("Notification not found");
+      }
+    } catch (err: any) {
+      console.error("Delete error:", err);
+      toast.error("Error deleting notification");
     }
   };
 
@@ -603,20 +804,72 @@ const Admin = () => {
       // Send notification
       const usersSnap = await get(ref(db, "users"));
       const users = usersSnap.val() || {};
-      const promises: any[] = [];
-      const notifTitle = contentType === "webseries" ? `New Episode: ${content.title}` : `New Movie: ${content.title}`;
-      const notifMsg = contentType === "webseries"
+      const releaseNotifTitle = contentType === "webseries" ? `New Episode: ${content.title}` : `New Movie: ${content.title}`;
+      const releaseNotifMsg = contentType === "webseries"
         ? `${episodeInfo.seasonName} - Episode ${episodeInfo.episodeNumber} is now available!`
         : `${content.title} (${content.year}) is now available!`;
-      Object.keys(users).forEach(userId => {
-        promises.push(push(ref(db, `notifications/${userId}`), {
-          title: notifTitle, message: notifMsg, type: "new_episode", contentId,
-          contentType, timestamp: Date.now(), read: false
-        }));
+
+      const userNotifUpdates: Record<string, any> = {};
+      const seenUserIds = new Set<string>();
+      Object.entries(users).forEach(([userKey, userData]: any) => {
+        const effectiveUserId = String(userData?.id || userKey || "").trim();
+        if (!effectiveUserId || seenUserIds.has(effectiveUserId)) return;
+        seenUserIds.add(effectiveUserId);
+
+        const notifKey = push(ref(db, `notifications/${effectiveUserId}`)).key;
+        if (!notifKey) return;
+
+        userNotifUpdates[`notifications/${effectiveUserId}/${notifKey}`] = {
+          title: releaseNotifTitle,
+          message: releaseNotifMsg,
+          type: "new_episode",
+          contentId,
+          contentType,
+          image: content.poster || "",
+          poster: content.poster || "",
+          timestamp: Date.now(),
+          read: false,
+        };
       });
-      await Promise.all(promises);
-      toast.success("Notification sent to users");
+
+      if (Object.keys(userNotifUpdates).length > 0) {
+        await update(ref(db), userNotifUpdates);
+      }
+      toast.success("In-app notification sent to users");
       setReleaseContent(""); setShowSeasonEpisode(false);
+      
+      // Send FCM push WITH progress (foreground)
+      const pushPayload = {
+        title: releaseNotifTitle,
+        body: releaseNotifMsg,
+        image: content.poster || undefined,
+        url: contentId ? `/?anime=${contentId}` : "/",
+        data: { url: contentId ? `/?anime=${contentId}` : "/", type: "new_episode", contentId },
+      };
+
+      setPushSending(true);
+      setPushProgress({ phase: "tokens", totalTokens: 0, sent: 0, success: 0, failed: 0, invalidRemoved: 0 });
+
+      try {
+        const targetUserIds = Array.from(new Set(
+          Object.entries(users)
+            .map(([userKey, userData]: any) => String(userData?.id || userKey || "").trim())
+            .filter(Boolean)
+        ));
+        const result = await sendPushToUsers(targetUserIds, pushPayload, (p) => setPushProgress({ ...p }));
+        console.log("FCM new release result:", result);
+        if ((result?.total || 0) === 0) {
+          const reason = result?.reason ? ` [${result.reason}]` : "";
+          toast.warning(`Push token পাওয়া যায়নি${reason} — শুধু in-app notification গেছে`);
+        } else {
+          toast.success(`Push: ${result?.success || 0} delivered, ${result?.failed || 0} failed`);
+        }
+      } catch (err) {
+        console.warn("FCM push failed:", err);
+        toast.error("Push delivery failed");
+      } finally {
+        setTimeout(() => { setPushSending(false); setPushProgress(null); }, 6000);
+      }
     } catch (err: any) { toast.error("Error: " + err.message); }
   };
 
@@ -802,13 +1055,16 @@ const Admin = () => {
     { section: "webseries", icon: <Film size={16} />, label: "Web Series" },
     { section: "movies", icon: <Video size={16} />, label: "Movies" },
     { section: "users", icon: <Users size={16} />, label: "Users" },
-    { section: "notifications", icon: <Bell size={16} />, label: "Notifications", group: "New Features" },
+    { section: "comments", icon: <MessageCircle size={16} />, label: "Comments", group: "New Features" },
+    { section: "notifications", icon: <Bell size={16} />, label: "Notifications" },
     { section: "new-releases", icon: <Zap size={16} />, label: "New Releases" },
     { section: "add-content", icon: <PlusCircle size={16} />, label: "Add Content", group: "Quick Actions" },
     { section: "tmdb-fetch", icon: <CloudDownload size={16} />, label: "TMDB Fetch" },
     { section: "redeem-codes", icon: <Shield size={16} />, label: "Redeem Codes" },
     { section: "free-access", icon: <Eye size={16} />, label: "Free Access", group: "Tracking" },
+    { section: "analytics", icon: <BarChart3 size={16} />, label: "Analytics & Views" },
     { section: "maintenance", icon: <Power size={16} />, label: "Maintenance", group: "Server" },
+    { section: "settings", icon: <Settings size={16} />, label: "Settings" },
   ];
 
   // ==================== LOGIN SCREEN ====================
@@ -873,7 +1129,73 @@ const Admin = () => {
         </div>
       )}
 
-      {/* PIN Setup Modal */}
+      {/* Push Progress Overlay */}
+      {pushSending && pushProgress && (
+        <div className="fixed bottom-4 right-4 left-4 sm:left-auto sm:w-[400px] z-[6000]">
+          <div className="bg-gradient-to-br from-[rgba(26,26,46,0.98)] to-[rgba(21,21,33,0.99)] backdrop-blur-xl border border-purple-500/30 rounded-2xl p-4 shadow-[0_10px_40px_rgba(0,0,0,0.5)]">
+            <div className="flex items-center justify-between mb-2">
+              <span className="text-sm font-semibold text-white flex items-center gap-2">
+                <Send size={14} className="text-purple-400" />
+                Push Notification Delivery
+              </span>
+              {pushProgress.phase === "done" ? (
+                <span className={`text-xs px-2 py-0.5 rounded-full ${pushProgress.totalTokens > 0 ? "bg-green-500/20 text-green-400" : "bg-yellow-500/20 text-yellow-300"}`}>
+                  {pushProgress.totalTokens > 0 ? "Complete" : "No tokens"}
+                </span>
+              ) : (
+                <span className="text-xs bg-purple-500/20 text-purple-400 px-2 py-0.5 rounded-full animate-pulse">
+                  {pushProgress.phase === "tokens" ? "Fetching tokens..." : pushProgress.phase === "cleanup" ? "Cleanup..." : "Sending..."}
+                </span>
+              )}
+            </div>
+            
+            {/* Progress bar */}
+            <div className="w-full h-2.5 bg-[#1A1A2E] rounded-full overflow-hidden mb-2">
+              <div
+                className={`h-full rounded-full transition-all duration-300 ${
+                  pushProgress.phase === "done" ? "bg-gradient-to-r from-green-500 to-emerald-400" : "bg-gradient-to-r from-purple-600 to-purple-400"
+                }`}
+                style={{ width: `${pushProgress.phase === "done" ? 100 : pushProgress.phase === "sending" && pushProgress.totalTokens > 0 ? Math.min(100, (pushProgress.sent / pushProgress.totalTokens) * 100) : pushProgress.phase === "tokens" ? 0 : 50}%` }}
+              />
+            </div>
+
+            {/* Stats */}
+            <div className="flex items-center justify-between text-xs text-[#957DAD] gap-2 flex-wrap">
+              {typeof pushProgress.totalUsers === "number" && pushProgress.totalUsers > 0 && <span>👥 {pushProgress.totalUsers} users</span>}
+              <span>📡 {pushProgress.phase === "done" ? pushProgress.totalTokens : (pushProgress.totalTokens || fcmTokenStats.totalTokens)} tokens</span>
+              {pushProgress.phase === "done" && (
+                <>
+                  <span className="text-green-400">✓ {pushProgress.success} sent</span>
+                  {pushProgress.failed > 0 && <span className="text-red-400">✗ {pushProgress.failed} failed</span>}
+                  {pushProgress.invalidRemoved > 0 && <span className="text-yellow-400">🗑 {pushProgress.invalidRemoved} removed</span>}
+                </>
+              )}
+              {pushProgress.phase === "sending" && (
+                <span className="text-purple-400 animate-pulse">Processing on server...</span>
+              )}
+              {pushProgress.phase === "tokens" && (
+                <span className="text-purple-400 animate-pulse">Loading tokens...</span>
+              )}
+            </div>
+
+            {pushProgress.phase === "done" && pushProgress.failReasons && pushProgress.failed > 0 && (
+              <div className="mt-2 flex items-center gap-3 text-[11px] flex-wrap">
+                {pushProgress.failReasons.invalid > 0 && <span className="text-red-400 bg-red-500/10 px-2 py-0.5 rounded-full">Invalid: {pushProgress.failReasons.invalid}</span>}
+                {pushProgress.failReasons.transient > 0 && <span className="text-yellow-400 bg-yellow-500/10 px-2 py-0.5 rounded-full">Transient: {pushProgress.failReasons.transient}</span>}
+                {pushProgress.failReasons.other > 0 && <span className="text-orange-400 bg-orange-500/10 px-2 py-0.5 rounded-full">Other: {pushProgress.failReasons.other}</span>}
+              </div>
+            )}
+            {pushProgress.phase === "done" && (
+              <div className={`mt-2 text-xs text-center ${pushProgress.totalTokens > 0 ? "text-green-400/80" : "text-yellow-300"}`}>
+                {pushProgress.totalTokens > 0
+                  ? `Delivery: ${pushProgress.success} sent${pushProgress.failed > 0 ? `, ${pushProgress.failed} failed` : ""}${pushProgress.invalidRemoved > 0 ? `, ${pushProgress.invalidRemoved} invalid removed` : ""}`
+                  : "No active push tokens found"}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
       {showPinSetup && (
         <div className="fixed inset-0 bg-black/80 z-[5000] flex items-center justify-center p-4" onClick={() => setShowPinSetup(false)}>
           <div className={`${glassCard} p-6 w-full max-w-[350px]`} onClick={e => e.stopPropagation()}>
@@ -1088,9 +1410,21 @@ const Admin = () => {
 
             {seriesTab === "ws-list" && (
               <div>
-                {webseriesData.length === 0 ? (
-                  <p className="text-[#957DAD] text-[13px] text-center py-8">No web series yet</p>
-                ) : webseriesData.map(item => (
+                {/* Search bar */}
+                <div className="mb-3">
+                  <div className="relative">
+                    <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-purple-500" />
+                    <input value={wsListSearch} onChange={e => setWsListSearch(e.target.value)}
+                      className={`${inputClass} pl-9`} placeholder="Search series..." />
+                  </div>
+                </div>
+                {(() => {
+                  const filtered = wsListSearch.trim()
+                    ? webseriesData.filter(item => item.title?.toLowerCase().includes(wsListSearch.toLowerCase()))
+                    : webseriesData;
+                  return filtered.length === 0 ? (
+                    <p className="text-[#957DAD] text-[13px] text-center py-8">{wsListSearch.trim() ? "No matching series" : "No web series yet"}</p>
+                  ) : filtered.map(item => (
                   <div key={item.id} className="bg-[#1A1A2E] border border-white/5 rounded-[14px] p-3.5 mb-3 hover:border-purple-500/30 transition-all">
                     <div className="flex gap-3.5">
                       <img src={item.poster || ""} className="w-20 h-[115px] rounded-[10px] object-cover flex-shrink-0"
@@ -1110,7 +1444,8 @@ const Admin = () => {
                       </div>
                     </div>
                   </div>
-                ))}
+                  ));
+                })()}
               </div>
             )}
 
@@ -1284,9 +1619,21 @@ const Admin = () => {
 
             {moviesTab === "mv-list" && (
               <div>
-                {moviesData.length === 0 ? (
-                  <p className="text-[#957DAD] text-[13px] text-center py-8">No movies yet</p>
-                ) : moviesData.map(item => (
+                {/* Search bar */}
+                <div className="mb-3">
+                  <div className="relative">
+                    <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-purple-500" />
+                    <input value={mvListSearch} onChange={e => setMvListSearch(e.target.value)}
+                      className={`${inputClass} pl-9`} placeholder="Search movies..." />
+                  </div>
+                </div>
+                {(() => {
+                  const filtered = mvListSearch.trim()
+                    ? moviesData.filter(item => item.title?.toLowerCase().includes(mvListSearch.toLowerCase()))
+                    : moviesData;
+                  return filtered.length === 0 ? (
+                    <p className="text-[#957DAD] text-[13px] text-center py-8">{mvListSearch.trim() ? "No matching movies" : "No movies yet"}</p>
+                  ) : filtered.map(item => (
                   <div key={item.id} className="bg-[#1A1A2E] border border-white/5 rounded-[14px] p-3.5 mb-3 hover:border-purple-500/30 transition-all">
                     <div className="flex gap-3.5">
                       <img src={item.poster || ""} className="w-20 h-[115px] rounded-[10px] object-cover flex-shrink-0"
@@ -1306,7 +1653,8 @@ const Admin = () => {
                       </div>
                     </div>
                   </div>
-                ))}
+                  ));
+                })()}
               </div>
             )}
 
@@ -1494,12 +1842,33 @@ const Admin = () => {
                 <textarea value={notifMessage} onChange={e => setNotifMessage(e.target.value)}
                   className={`${inputClass} min-h-[80px] resize-y`} placeholder="Enter notification message" rows={3} />
               </div>
-              <div className="mb-4">
+              <div className="mb-4" ref={notifDropdownRef}>
                 <label className="block text-xs text-[#D1C4E9] mb-2 font-medium">Select Content (Optional)</label>
-                <select value={notifContent} onChange={e => setNotifContent(e.target.value)} className={selectClass}>
-                  <option value="">No specific content</option>
-                  {contentOptions.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
-                </select>
+                <div className="relative">
+                  <button type="button" onClick={() => setNotifDropdownOpen(!notifDropdownOpen)}
+                    className={`${selectClass} w-full text-left flex items-center gap-2`}>
+                    {notifContent ? (
+                      <>
+                        <img src={contentOptions.find(o => o.value === notifContent)?.poster} alt="" className="w-7 h-10 rounded object-cover flex-shrink-0" />
+                        <span className="truncate text-sm">{contentOptions.find(o => o.value === notifContent)?.label}</span>
+                      </>
+                    ) : <span className="text-[#957DAD]">No specific content</span>}
+                    <ChevronDown size={14} className="ml-auto flex-shrink-0" />
+                  </button>
+                  {notifDropdownOpen && (
+                    <div className="absolute z-50 top-full left-0 right-0 mt-1 bg-[#1A1A2E] border border-purple-500/40 rounded-xl max-h-[280px] overflow-y-auto shadow-xl">
+                      <div className="p-2 cursor-pointer hover:bg-purple-500/20 rounded-lg m-1 text-sm text-[#957DAD]"
+                        onClick={() => { setNotifContent(""); setNotifDropdownOpen(false); }}>No specific content</div>
+                      {contentOptions.map(o => (
+                        <div key={o.value} className={`flex items-center gap-2.5 p-2 cursor-pointer hover:bg-purple-500/20 rounded-lg m-1 ${notifContent === o.value ? "bg-purple-500/30" : ""}`}
+                          onClick={() => { setNotifContent(o.value); setNotifDropdownOpen(false); }}>
+                          <img src={o.poster} alt="" className="w-8 h-11 rounded object-cover flex-shrink-0 bg-[#2A2A3E]" />
+                          <span className="text-sm truncate">{o.label}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
               </div>
               <div className="mb-4">
                 <label className="block text-xs text-[#D1C4E9] mb-2 font-medium">Notification Type</label>
@@ -1526,30 +1895,40 @@ const Admin = () => {
               <h3 className="text-sm font-semibold mb-3.5 flex items-center gap-2">
                 <RefreshCw size={14} className="text-purple-500" /> Recent Notifications
               </h3>
-              {notificationsData.length === 0 ? (
-                <p className="text-[#957DAD] text-[13px] text-center py-5">No notifications sent yet</p>
-              ) : notificationsData.slice(0, 10).map(notif => (
-                <div key={`${notif.userId}-${notif.id}`} className="bg-[#1A1A2E] border border-purple-500/30 rounded-xl p-4 mb-3">
-                  <div className="flex justify-between items-start mb-2">
-                    <div>
-                      <span className="bg-gradient-to-r from-pink-500 to-pink-600 text-white text-[10px] font-bold px-2 py-0.5 rounded-[10px] inline-flex items-center gap-1">
-                        <Bell size={10} /> {notif.type}
-                      </span>
-                      <span className="text-[11px] text-[#957DAD] ml-2.5">{formatTime(notif.timestamp)}</span>
+              {(() => {
+                // Deduplicate notifications - group by title+message, show unique ones only
+                const seen = new Set<string>();
+                const uniqueNotifs = notificationsData.filter(notif => {
+                  const key = `${notif.title}||${notif.message}`;
+                  if (seen.has(key)) return false;
+                  seen.add(key);
+                  return true;
+                });
+                return uniqueNotifs.length === 0 ? (
+                  <p className="text-[#957DAD] text-[13px] text-center py-5">No notifications sent yet</p>
+                ) : uniqueNotifs.slice(0, 15).map((notif, idx) => (
+                  <div key={`notif-${idx}-${notif.timestamp}`} className="bg-[#1A1A2E] border border-purple-500/30 rounded-xl p-4 mb-3">
+                    <div className="flex justify-between items-start mb-2">
+                      <div>
+                        <span className="bg-gradient-to-r from-pink-500 to-pink-600 text-white text-[10px] font-bold px-2 py-0.5 rounded-[10px] inline-flex items-center gap-1">
+                          <Bell size={10} /> {notif.type}
+                        </span>
+                        <span className="text-[11px] text-[#957DAD] ml-2.5">{formatTime(notif.timestamp)}</span>
+                      </div>
+                      <button onClick={() => deleteNotification(notif.title, notif.message, notif.timestamp)} className="text-[#957DAD] hover:text-red-400 transition-colors">
+                        <X size={14} />
+                      </button>
                     </div>
-                    <button onClick={() => deleteNotification(notif.userId, notif.id)} className="text-[#957DAD] hover:text-red-400 transition-colors">
-                      <X size={14} />
-                    </button>
+                    <h4 className="text-[13px] font-semibold mb-1.5">{notif.title}</h4>
+                    <p className="text-xs text-[#D1C4E9]">{notif.message}</p>
+                    {notif.contentId && (
+                      <div className="mt-2 text-[11px] text-purple-500 flex items-center gap-1">
+                        <Link size={10} /> Linked to content
+                      </div>
+                    )}
                   </div>
-                  <h4 className="text-[13px] font-semibold mb-1.5">{notif.title}</h4>
-                  <p className="text-xs text-[#D1C4E9]">{notif.message}</p>
-                  {notif.contentId && (
-                    <div className="mt-2 text-[11px] text-purple-500 flex items-center gap-1">
-                      <Link size={10} /> Linked to content
-                    </div>
-                  )}
-                </div>
-              ))}
+                ));
+              })()}
             </div>
           </div>
         )}
@@ -1557,16 +1936,35 @@ const Admin = () => {
         {/* ==================== NEW RELEASES ==================== */}
         {activeSection === "new-releases" && (
           <div>
-            <div className={`${glassCard} p-4 mb-4`}>
+            <div className={`${glassCard} relative z-[120] overflow-visible p-4 mb-4`}>
               <h3 className="text-sm font-semibold mb-3.5 flex items-center gap-2">
                 <Zap size={14} className="text-pink-500" /> Manage New Episode Releases
               </h3>
-              <div className="mb-4">
+              <div className="mb-4" ref={releaseDropdownRef}>
                 <label className="block text-xs text-[#D1C4E9] mb-2 font-medium">Select Content to Add as New Release</label>
-                <select value={releaseContent} onChange={e => handleReleaseContentChange(e.target.value)} className={selectClass}>
-                  <option value="">Select Content</option>
-                  {contentOptions.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
-                </select>
+                <div className="relative z-[130]">
+                  <button type="button" onClick={() => setReleaseDropdownOpen(!releaseDropdownOpen)}
+                    className={`${selectClass} w-full text-left flex items-center gap-2`}>
+                    {releaseContent ? (
+                      <>
+                        <img src={contentOptions.find(o => o.value === releaseContent)?.poster} alt="" className="w-7 h-10 rounded object-cover flex-shrink-0" />
+                        <span className="truncate text-sm">{contentOptions.find(o => o.value === releaseContent)?.label}</span>
+                      </>
+                    ) : <span className="text-[#957DAD]">Select Content</span>}
+                    <ChevronDown size={14} className="ml-auto flex-shrink-0" />
+                  </button>
+                  {releaseDropdownOpen && (
+                    <div className="absolute z-[200] top-full left-0 right-0 mt-1 bg-[#1A1A2E] border border-purple-500/40 rounded-xl max-h-[280px] overflow-y-auto shadow-xl">
+                      {contentOptions.map(o => (
+                        <div key={o.value} className={`flex items-center gap-2.5 p-2 cursor-pointer hover:bg-purple-500/20 rounded-lg m-1 ${releaseContent === o.value ? "bg-purple-500/30" : ""}`}
+                          onClick={() => { handleReleaseContentChange(o.value); setReleaseDropdownOpen(false); }}>
+                          <img src={o.poster} alt="" className="w-8 h-11 rounded object-cover flex-shrink-0 bg-[#2A2A3E]" />
+                          <span className="text-sm truncate">{o.label}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
               </div>
               {showSeasonEpisode && (
                 <>
@@ -1593,7 +1991,7 @@ const Admin = () => {
               )}
             </div>
 
-            <div className={`${glassCard} p-4`}>
+            <div className={`${glassCard} relative z-10 p-4`}>
               <h3 className="text-sm font-semibold mb-3.5 flex items-center gap-2">
                 📋 Active New Releases
               </h3>
@@ -1754,6 +2152,102 @@ const Admin = () => {
         {/* ==================== FREE ACCESS USERS ==================== */}
         {activeSection === "free-access" && (
           <div>
+            {/* Global Free Access for All */}
+            <div className={`${glassCard} p-4 mb-4`}>
+              <h3 className="text-sm font-semibold mb-3.5 flex items-center gap-2">
+                <Zap size={14} className="text-yellow-500" /> Free Access for All Users
+              </h3>
+              <p className="text-[11px] text-[#D1C4E9] mb-4">
+                সব ইউজারকে নির্দিষ্ট সময়ের জন্য ফ্রী এক্সেস দিন। এই সময়ের মধ্যে কোনো অ্যাড গেট থাকবে না।
+              </p>
+
+              {/* Current status */}
+              {globalFreeAccess?.active && globalFreeAccess?.expiresAt > Date.now() ? (
+                <div className="bg-green-500/10 border border-green-500/30 rounded-xl p-4 mb-4">
+                  <div className="flex items-center justify-between mb-2">
+                    <span className="text-sm font-semibold text-green-400 flex items-center gap-2">
+                      <Zap size={14} /> গ্লোবাল ফ্রী এক্সেস অ্যাক্টিভ
+                    </span>
+                    <span className="text-xs bg-green-500/20 text-green-400 px-2 py-0.5 rounded-full">LIVE</span>
+                  </div>
+                  <div className="text-[11px] text-[#D1C4E9] space-y-1">
+                    <p>শুরু: {new Date(globalFreeAccess.activatedAt).toLocaleString("bn-BD", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })}</p>
+                    <p>শেষ: {new Date(globalFreeAccess.expiresAt).toLocaleString("bn-BD", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })}</p>
+                    {(() => {
+                      const rem = globalFreeAccess.expiresAt - Date.now();
+                      const h = Math.floor(rem / 3600000);
+                      const m = Math.floor((rem % 3600000) / 60000);
+                      return <p className="text-green-400 font-semibold">বাকি: {h}h {m}m</p>;
+                    })()}
+                  </div>
+                  <button
+                    onClick={() => {
+                      if (confirm("গ্লোবাল ফ্রী এক্সেস বন্ধ করতে চান?")) {
+                        set(ref(db, "globalFreeAccess"), { active: false, expiresAt: 0, activatedAt: 0 })
+                          .then(() => toast.success("গ্লোবাল ফ্রী এক্সেস বন্ধ করা হয়েছে"))
+                          .catch((err) => toast.error("Error: " + err.message));
+                      }
+                    }}
+                    className={`${btnSecondary} mt-3 w-full py-2.5 text-sm flex items-center justify-center gap-2 text-red-400 border-red-500/30 hover:border-red-500`}
+                  >
+                    <X size={14} /> ফ্রী এক্সেস বন্ধ করুন
+                  </button>
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  <div className="flex gap-2">
+                    <div className="flex-1">
+                      <label className="text-[11px] text-[#957DAD] mb-1 block">ঘন্টা</label>
+                      <input
+                        type="number"
+                        min="0"
+                        max="720"
+                        value={globalFreeHours}
+                        onChange={(e) => setGlobalFreeHours(e.target.value)}
+                        className={inputClass}
+                        placeholder="2"
+                      />
+                    </div>
+                    <div className="flex-1">
+                      <label className="text-[11px] text-[#957DAD] mb-1 block">মিনিট</label>
+                      <input
+                        type="number"
+                        min="0"
+                        max="59"
+                        value={globalFreeMinutes}
+                        onChange={(e) => setGlobalFreeMinutes(e.target.value)}
+                        className={inputClass}
+                        placeholder="0"
+                      />
+                    </div>
+                  </div>
+                  <button
+                    onClick={() => {
+                      const hours = parseInt(globalFreeHours) || 0;
+                      const minutes = parseInt(globalFreeMinutes) || 0;
+                      const totalMs = (hours * 3600000) + (minutes * 60000);
+                      if (totalMs < 60000) {
+                        toast.error("কমপক্ষে ১ মিনিট সময় দিন");
+                        return;
+                      }
+                      if (!confirm(`সব ইউজারকে ${hours > 0 ? hours + " ঘন্টা " : ""}${minutes > 0 ? minutes + " মিনিট " : ""}ফ্রী এক্সেস দিতে চান?`)) return;
+                      const now = Date.now();
+                      set(ref(db, "globalFreeAccess"), {
+                        active: true,
+                        activatedAt: now,
+                        expiresAt: now + totalMs,
+                      })
+                        .then(() => toast.success("গ্লোবাল ফ্রী এক্সেস চালু হয়েছে!"))
+                        .catch((err) => toast.error("Error: " + err.message));
+                    }}
+                    className={`${btnPrimary} w-full py-3 text-sm flex items-center justify-center gap-2`}
+                  >
+                    <Zap size={14} /> সব ইউজারকে ফ্রী এক্সেস দিন
+                  </button>
+                </div>
+              )}
+            </div>
+
             <div className={`${glassCard} p-4 mb-4`}>
               <h3 className="text-sm font-semibold mb-3.5 flex items-center gap-2">
                 <Eye size={14} className="text-green-500" /> Active Free Access Users ({freeAccessUsers.length})
@@ -1798,6 +2292,75 @@ const Admin = () => {
           </div>
         )}
 
+        {/* ==================== SETTINGS ==================== */}
+        {activeSection === "settings" && (
+          <div>
+            <div className={`${glassCard} p-4 mb-4`}>
+              <h3 className="text-sm font-semibold mb-3.5 flex items-center gap-2">
+                <Link size={14} className="text-purple-400" /> Tutorial Video URL
+              </h3>
+              <p className="text-[11px] text-[#D1C4E9] mb-4">
+                ফ্রি ইউজারদের Unlock বাটনের নিচে "How to open my link" বাটনে এই ভিডিওটি প্লে হবে। ভিডিও URL দিন (MP4 বা embed link)।
+              </p>
+              <div className="flex gap-2">
+                <input
+                  type="url"
+                  value={tutorialLinkInput}
+                  onChange={(e) => setTutorialLinkInput(e.target.value)}
+                  placeholder="https://example.com/tutorial-video.mp4"
+                  className={`${inputClass} flex-1`}
+                />
+                <button
+                  onClick={async () => {
+                    if (!tutorialLinkInput.trim()) {
+                      toast.error("Please enter a valid URL");
+                      return;
+                    }
+                    try {
+                      await set(ref(db, "settings/tutorialLink"), tutorialLinkInput.trim());
+                      toast.success("Tutorial video link saved!");
+                    } catch (err) {
+                      console.error("Save failed:", err);
+                      toast.error("Failed to save. Check Firebase rules.");
+                    }
+                  }}
+                  className={`${btnPrimary} !px-4`}
+                >
+                  <Save size={14} /> Save
+                </button>
+              </div>
+              {tutorialLink && (
+                <div className="mt-3 flex items-center gap-2">
+                  <span className="text-[11px] text-green-400">✓ Active:</span>
+                  <a href={tutorialLink} target="_blank" rel="noopener noreferrer" className="text-[11px] text-purple-400 underline truncate max-w-[250px]">{tutorialLink}</a>
+                  <button
+                    onClick={() => {
+                      set(ref(db, "settings/tutorialLink"), null);
+                      setTutorialLinkInput("");
+                      toast.success("Tutorial link removed!");
+                    }}
+                    className="text-red-400 hover:text-red-300 ml-auto"
+                  >
+                    <Trash2 size={12} />
+                  </button>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* ==================== COMMENTS ==================== */}
+        {activeSection === "comments" && (
+          <AdminCommentsSection
+            commentsData={commentsData}
+            glassCard={glassCard}
+            inputClass={inputClass}
+            btnPrimary={btnPrimary}
+            webseriesData={webseriesData}
+            moviesData={moviesData}
+          />
+        )}
+
         {/* ==================== MAINTENANCE ==================== */}
         {activeSection === "maintenance" && (
           <MaintenanceSection
@@ -1812,6 +2375,279 @@ const Admin = () => {
             setMaintenanceResumeDate={setMaintenanceResumeDate}
           />
         )}
+
+        {/* ==================== ANALYTICS ==================== */}
+        {activeSection === "analytics" && (() => {
+          const today = new Date().toISOString().split("T")[0];
+          const todayViewers = dailyActiveUsers[today] ? Object.keys(dailyActiveUsers[today]).length : 0;
+
+          const currentViewersList: { animeId: string; title: string; viewers: { uid: string; userName: string; startedAt: number }[] }[] = [];
+          let totalCurrentViewers = 0;
+          Object.entries(activeViewers).forEach(([aId, users]: [string, any]) => {
+            const viewerArr: { uid: string; userName: string; startedAt: number }[] = [];
+            Object.entries(users || {}).forEach(([uid, data]: [string, any]) => {
+              viewerArr.push({ uid, userName: data.userName || "User", startedAt: data.startedAt || 0 });
+            });
+            if (viewerArr.length > 0) {
+              const ws = webseriesData.find(w => w.id === aId);
+              const mv = moviesData.find(m => m.id === aId);
+              const cTitle = ws?.title || mv?.title || aId;
+              currentViewersList.push({ animeId: aId, title: cTitle, viewers: viewerArr });
+              totalCurrentViewers += viewerArr.length;
+            }
+          });
+          currentViewersList.sort((a, b) => b.viewers.length - a.viewers.length);
+
+          const contentViewStats: { animeId: string; title: string; viewCount: number; poster: string }[] = [];
+          Object.entries(analyticsViews).forEach(([aId, dates]: [string, any]) => {
+            const todayData = dates?.[today];
+            if (todayData) {
+              const count = Object.keys(todayData).length;
+              const ws = webseriesData.find(w => w.id === aId);
+              const mv = moviesData.find(m => m.id === aId);
+              contentViewStats.push({ animeId: aId, title: ws?.title || mv?.title || aId, viewCount: count, poster: ws?.poster || mv?.poster || "" });
+            }
+          });
+          contentViewStats.sort((a, b) => b.viewCount - a.viewCount);
+
+          const allTimeStats: { animeId: string; title: string; totalViews: number; poster: string }[] = [];
+          Object.entries(analyticsViews).forEach(([aId, dates]: [string, any]) => {
+            let total = 0;
+            Object.values(dates || {}).forEach((dayUsers: any) => { total += Object.keys(dayUsers || {}).length; });
+            if (total > 0) {
+              const ws = webseriesData.find(w => w.id === aId);
+              const mv = moviesData.find(m => m.id === aId);
+              allTimeStats.push({ animeId: aId, title: ws?.title || mv?.title || aId, totalViews: total, poster: ws?.poster || mv?.poster || "" });
+            }
+          });
+          allTimeStats.sort((a, b) => b.totalViews - a.totalViews);
+
+          const last7Days: { date: string; count: number }[] = [];
+          for (let i = 6; i >= 0; i--) {
+            const d = new Date(); d.setDate(d.getDate() - i);
+            const dateStr = d.toISOString().split("T")[0];
+            const dayUsers = dailyActiveUsers[dateStr];
+            last7Days.push({ date: dateStr, count: dayUsers ? Object.keys(dayUsers).length : 0 });
+          }
+          const maxDayCount = Math.max(...last7Days.map(d => d.count), 1);
+
+          return (
+            <div>
+              {/* Summary Cards */}
+              <div className="grid grid-cols-3 gap-3 mb-5">
+                <div className="bg-gradient-to-br from-[#1A1A2E] to-[#151521] border border-green-500/20 rounded-2xl p-4">
+                  <div className="w-10 h-10 bg-green-500/15 rounded-xl flex items-center justify-center mb-2 text-green-500">
+                    <Activity size={18} />
+                  </div>
+                  <div className="text-2xl font-extrabold text-green-400">{totalCurrentViewers}</div>
+                  <div className="text-[10px] text-[#D1C4E9] mt-1">Watching Now</div>
+                </div>
+                <div className="bg-gradient-to-br from-[#1A1A2E] to-[#151521] border border-purple-500/20 rounded-2xl p-4">
+                  <div className="w-10 h-10 bg-purple-500/15 rounded-xl flex items-center justify-center mb-2 text-purple-500">
+                    <Eye size={18} />
+                  </div>
+                  <div className="text-2xl font-extrabold bg-gradient-to-r from-purple-500 to-pink-500 bg-clip-text text-transparent">{todayViewers}</div>
+                  <div className="text-[10px] text-[#D1C4E9] mt-1">Today's Viewers</div>
+                </div>
+                <div className="bg-gradient-to-br from-[#1A1A2E] to-[#151521] border border-blue-500/20 rounded-2xl p-4">
+                  <div className="w-10 h-10 bg-blue-500/15 rounded-xl flex items-center justify-center mb-2 text-blue-500">
+                    <TrendingUp size={18} />
+                  </div>
+                  <div className="text-2xl font-extrabold text-blue-400">{contentViewStats.length}</div>
+                  <div className="text-[10px] text-[#D1C4E9] mt-1">Active Content</div>
+                </div>
+              </div>
+
+              {/* Currently Watching - Live */}
+              <div className={`${glassCard} p-4 mb-4`}>
+                <h3 className="text-sm font-semibold mb-3.5 flex items-center gap-2">
+                  <Activity size={14} className="text-green-500 animate-pulse" /> Currently Watching (Live)
+                </h3>
+                {currentViewersList.length === 0 ? (
+                  <p className="text-[#957DAD] text-[13px] text-center py-5">No one watching right now</p>
+                ) : (
+                  <div className="space-y-3">
+                    {currentViewersList.map(item => (
+                      <div key={item.animeId} className="bg-[#1A1A2E] border border-green-500/20 rounded-xl p-3.5">
+                        <div className="flex items-center justify-between mb-2">
+                          <span className="text-[13px] font-semibold truncate flex-1">{item.title}</span>
+                          <span className="text-xs bg-green-500/20 text-green-400 px-2 py-0.5 rounded-full font-bold ml-2 flex items-center gap-1">
+                            <div className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse" />
+                            {item.viewers.length}
+                          </span>
+                        </div>
+                        <div className="flex flex-wrap gap-1.5">
+                          {item.viewers.map(v => (
+                            <span key={v.uid} className="text-[10px] bg-green-500/10 text-green-300 px-2 py-1 rounded-lg">
+                              👤 {v.userName} ({formatTime(v.startedAt)})
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              {/* 7-Day Trend Chart */}
+              <div className={`${glassCard} p-4 mb-4`}>
+                <h3 className="text-sm font-semibold mb-3.5 flex items-center gap-2">
+                  <TrendingUp size={14} className="text-blue-500" /> Last 7 Days - Daily Viewers
+                </h3>
+                <div className="flex items-end gap-2 h-[120px]">
+                  {last7Days.map((day) => (
+                    <div key={day.date} className="flex-1 flex flex-col items-center justify-end h-full">
+                      <span className="text-[10px] text-purple-400 font-bold mb-1">{day.count}</span>
+                      <div
+                        className="w-full rounded-t-lg bg-gradient-to-t from-purple-600 to-purple-400 transition-all duration-500"
+                        style={{ height: `${Math.max((day.count / maxDayCount) * 90, 4)}px` }}
+                      />
+                      <span className="text-[9px] text-[#957DAD] mt-1.5">
+                        {new Date(day.date).toLocaleDateString("en", { weekday: "short" })}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {/* Today's Top Content */}
+              <div className={`${glassCard} p-4 mb-4`}>
+                <h3 className="text-sm font-semibold mb-3.5 flex items-center gap-2">
+                  <BarChart3 size={14} className="text-purple-500" /> Today's Views by Content
+                </h3>
+                {contentViewStats.length === 0 ? (
+                  <p className="text-[#957DAD] text-[13px] text-center py-5">No views today yet</p>
+                ) : (
+                  <div className="space-y-2.5">
+                    {contentViewStats.slice(0, 20).map((item, idx) => (
+                      <div key={item.animeId} className="flex items-center gap-3 bg-[#1A1A2E] rounded-xl p-3 border border-white/5">
+                        <span className="text-[11px] text-[#957DAD] font-bold w-5">#{idx + 1}</span>
+                        {item.poster && (
+                          <img src={item.poster} className="w-9 h-[52px] rounded-lg object-cover flex-shrink-0"
+                            onError={e => { (e.target as HTMLImageElement).style.display = "none"; }} />
+                        )}
+                        <div className="flex-1 min-w-0">
+                          <p className="text-[12px] font-semibold truncate">{item.title}</p>
+                          <div className="w-full h-1.5 bg-[#0F0F1A] rounded-full mt-1.5 overflow-hidden">
+                            <div className="h-full rounded-full bg-gradient-to-r from-purple-600 to-pink-500 transition-all"
+                              style={{ width: `${Math.min(100, (item.viewCount / (contentViewStats[0]?.viewCount || 1)) * 100)}%` }} />
+                          </div>
+                        </div>
+                        <span className="text-sm font-bold text-purple-400 flex-shrink-0">{item.viewCount}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              {/* All-Time Top Content */}
+              <div className={`${glassCard} p-4 mb-4`}>
+                <h3 className="text-sm font-semibold mb-3.5 flex items-center gap-2">
+                  <TrendingUp size={14} className="text-pink-500" /> All-Time Most Watched
+                </h3>
+                {allTimeStats.length === 0 ? (
+                  <p className="text-[#957DAD] text-[13px] text-center py-5">No data yet</p>
+                ) : (
+                  <div className="space-y-2.5">
+                    {allTimeStats.slice(0, 15).map((item, idx) => (
+                      <div key={item.animeId} className="flex items-center gap-3 bg-[#1A1A2E] rounded-xl p-3 border border-white/5">
+                        <span className={`text-[11px] font-bold w-5 ${idx === 0 ? "text-yellow-400" : idx === 1 ? "text-gray-300" : idx === 2 ? "text-orange-400" : "text-[#957DAD]"}`}>
+                          #{idx + 1}
+                        </span>
+                        {item.poster && (
+                          <img src={item.poster} className="w-9 h-[52px] rounded-lg object-cover flex-shrink-0"
+                            onError={e => { (e.target as HTMLImageElement).style.display = "none"; }} />
+                        )}
+                        <div className="flex-1 min-w-0">
+                          <p className="text-[12px] font-semibold truncate">{item.title}</p>
+                        </div>
+                        <span className="text-sm font-bold text-pink-400 flex-shrink-0">{item.totalViews} views</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              {/* Today's Active Users */}
+              <div className={`${glassCard} p-4 mb-4`}>
+                <h3 className="text-sm font-semibold mb-3.5 flex items-center gap-2">
+                  <Users size={14} className="text-purple-500" /> Today's Active Users ({todayViewers})
+                </h3>
+                {!dailyActiveUsers[today] ? (
+                  <p className="text-[#957DAD] text-[13px] text-center py-5">No active users today</p>
+                ) : (
+                  <div className="flex flex-wrap gap-2">
+                    {Object.entries(dailyActiveUsers[today]).map(([uid, data]: [string, any]) => (
+                      <span key={uid} className="text-[11px] bg-purple-500/10 text-purple-300 px-3 py-1.5 rounded-full border border-purple-500/20">
+                        👤 {data.userName || uid.substring(0, 8)} • {formatTime(data.lastSeen)}
+                      </span>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              {/* Full Content Library - All Anime with Views */}
+              <div className={`${glassCard} p-4`}>
+                <h3 className="text-sm font-semibold mb-3.5 flex items-center gap-2">
+                  <Film size={14} className="text-purple-500" /> Full Content Library Views ({webseriesData.length + moviesData.length} items)
+                </h3>
+                <div className="space-y-2">
+                  {(() => {
+                    // Build full list of ALL content with their view counts
+                    const fullList = [
+                      ...webseriesData.map(ws => {
+                        let todayViews = 0;
+                        let totalViews = 0;
+                        const viewData = analyticsViews[ws.id];
+                        if (viewData) {
+                          if (viewData[today]) todayViews = Object.keys(viewData[today]).length;
+                          Object.values(viewData).forEach((dayUsers: any) => { totalViews += Object.keys(dayUsers || {}).length; });
+                        }
+                        return { id: ws.id, title: ws.title || "Untitled", poster: ws.poster || "", type: "Series", todayViews, totalViews };
+                      }),
+                      ...moviesData.map(mv => {
+                        let todayViews = 0;
+                        let totalViews = 0;
+                        const viewData = analyticsViews[mv.id];
+                        if (viewData) {
+                          if (viewData[today]) todayViews = Object.keys(viewData[today]).length;
+                          Object.values(viewData).forEach((dayUsers: any) => { totalViews += Object.keys(dayUsers || {}).length; });
+                        }
+                        return { id: mv.id, title: mv.title || "Untitled", poster: mv.poster || "", type: "Movie", todayViews, totalViews };
+                      }),
+                    ];
+                    fullList.sort((a, b) => b.totalViews - a.totalViews || b.todayViews - a.todayViews);
+                    const maxTotal = fullList[0]?.totalViews || 1;
+
+                    return fullList.map((item, idx) => (
+                      <div key={item.id} className="flex items-center gap-3 bg-[#1A1A2E] rounded-xl p-3 border border-white/5">
+                        <span className={`text-[11px] font-bold w-5 flex-shrink-0 ${idx === 0 ? "text-yellow-400" : idx === 1 ? "text-gray-300" : idx === 2 ? "text-orange-400" : "text-[#957DAD]"}`}>
+                          {idx + 1}
+                        </span>
+                        <img src={item.poster} className="w-8 h-[46px] rounded-lg object-cover flex-shrink-0 bg-[#0F0F1A]"
+                          onError={e => { (e.target as HTMLImageElement).src = "https://via.placeholder.com/32x46/1A1A2E/9D4EDD?text=N"; }} />
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center gap-1.5 mb-0.5">
+                            <p className="text-[11px] font-semibold truncate">{item.title}</p>
+                            <span className="text-[9px] bg-purple-500/20 text-purple-400 px-1.5 py-0.5 rounded flex-shrink-0">{item.type}</span>
+                          </div>
+                          <div className="w-full h-1 bg-[#0F0F1A] rounded-full overflow-hidden">
+                            <div className="h-full rounded-full bg-gradient-to-r from-purple-600 to-pink-500 transition-all"
+                              style={{ width: `${item.totalViews > 0 ? Math.max(3, (item.totalViews / maxTotal) * 100) : 0}%` }} />
+                          </div>
+                        </div>
+                        <div className="flex flex-col items-end flex-shrink-0">
+                          <span className="text-[11px] font-bold text-purple-400">{item.totalViews}</span>
+                          <span className="text-[9px] text-green-400">{item.todayViews > 0 ? `+${item.todayViews} today` : "—"}</span>
+                        </div>
+                      </div>
+                    ));
+                  })()}
+                </div>
+              </div>
+            </div>
+          );
+        })()}
       </main>
 
       {/* Bottom Navigation */}
@@ -2096,6 +2932,201 @@ const UserPasswordLookup = ({ inputClass, btnPrimary }: { inputClass: string; bt
           </div>
         </div>
       )}
+    </div>
+  );
+};
+
+// Admin Comments Section sub-component
+const AdminCommentsSection = ({
+  commentsData, glassCard, inputClass, btnPrimary, webseriesData, moviesData,
+}: {
+  commentsData: any[]; glassCard: string; inputClass: string; btnPrimary: string;
+  webseriesData: any[]; moviesData: any[];
+}) => {
+  const [replyText, setReplyText] = useState("");
+  const [replyingTo, setReplyingTo] = useState<string | null>(null);
+  const [filter, setFilter] = useState("");
+
+  const getContentTitle = (animeId: string) => {
+    const ws = webseriesData.find(s => s.id === animeId);
+    if (ws) return ws.title;
+    const mv = moviesData.find(m => m.id === animeId);
+    if (mv) return mv.title;
+    return animeId;
+  };
+
+  const formatTime = (ts: number) => {
+    if (!ts) return "";
+    const diff = Date.now() - ts;
+    if (diff < 60000) return "Just now";
+    if (diff < 3600000) return `${Math.floor(diff / 60000)}m ago`;
+    if (diff < 86400000) return `${Math.floor(diff / 3600000)}h ago`;
+    return new Date(ts).toLocaleDateString("en-US", { month: "short", day: "numeric" });
+  };
+
+  const postAdminReply = async (animeId: string, commentId: string) => {
+    if (!replyText.trim()) return;
+
+    const text = replyText.trim();
+    const targetComment = commentsData.find((c) => c.animeId === animeId && c.id === commentId);
+
+    try {
+      const now = Date.now();
+      const replyRef = push(ref(db, `comments/${animeId}/${commentId}/replies`));
+      await set(replyRef, {
+        userId: "admin",
+        userName: "Admin (RS)",
+        text,
+        timestamp: now,
+      });
+
+      if (targetComment?.userId && targetComment.userId !== "admin") {
+        const title = "Admin replied to your comment";
+        const message = `Admin replied on ${getContentTitle(animeId)}`;
+
+        await set(push(ref(db, `notifications/${targetComment.userId}`)), {
+          title,
+          message,
+          type: "admin_reply",
+          contentId: animeId,
+          image: targetComment.poster || "",
+          poster: targetComment.poster || "",
+          timestamp: now,
+          read: false,
+        });
+
+        sendPushToUsers([targetComment.userId], {
+          title,
+          body: message,
+          image: targetComment.poster || undefined,
+          url: `/?anime=${animeId}`,
+          data: { type: "admin_reply", animeId, commentId },
+        }).catch((err) => console.warn("Admin reply push failed:", err));
+      }
+
+      setReplyText("");
+      setReplyingTo(null);
+      toast.success("Reply posted!");
+    } catch {
+      toast.error("Error posting reply");
+    }
+  };
+
+  const deleteComment = (animeId: string, commentId: string) => {
+    if (confirm("Delete this comment?")) {
+      remove(ref(db, `comments/${animeId}/${commentId}`))
+        .then(() => toast.success("Comment deleted"))
+        .catch(() => toast.error("Error deleting"));
+    }
+  };
+
+  const deleteReply = (animeId: string, commentId: string, replyId: string) => {
+    if (confirm("Delete this reply?")) {
+      remove(ref(db, `comments/${animeId}/${commentId}/replies/${replyId}`))
+        .then(() => toast.success("Reply deleted"))
+        .catch(() => toast.error("Error deleting"));
+    }
+  };
+
+  const filteredComments = filter
+    ? commentsData.filter(c => getContentTitle(c.animeId).toLowerCase().includes(filter.toLowerCase()) || c.userName?.toLowerCase().includes(filter.toLowerCase()) || c.text?.toLowerCase().includes(filter.toLowerCase()))
+    : commentsData;
+
+  return (
+    <div>
+      <div className={`${glassCard} p-4 mb-4`}>
+        <h3 className="text-sm font-semibold mb-3.5 flex items-center gap-2">
+          <MessageCircle size={14} className="text-purple-500" /> All Comments ({commentsData.length})
+        </h3>
+        <input
+          value={filter}
+          onChange={e => setFilter(e.target.value)}
+          className={`${inputClass} mb-4`}
+          placeholder="🔍 Search comments by content, user, or text..."
+        />
+        {filteredComments.length === 0 ? (
+          <p className="text-[#957DAD] text-[13px] text-center py-8">No comments found</p>
+        ) : (
+          <div className="space-y-3 max-h-[600px] overflow-y-auto">
+            {filteredComments.slice(0, 50).map((comment) => (
+              <div key={comment.id} className="bg-[#1A1A2E] border border-white/5 rounded-xl p-3.5">
+                {/* Content label */}
+                <div className="flex items-center gap-2 mb-2">
+                  <span className="text-[10px] bg-purple-500/20 text-purple-400 px-2 py-0.5 rounded-full font-medium truncate max-w-[200px]">
+                    📺 {getContentTitle(comment.animeId)}
+                  </span>
+                  <span className="text-[10px] text-[#957DAD]">{formatTime(comment.timestamp)}</span>
+                </div>
+                {/* Comment */}
+                <div className="flex justify-between items-start">
+                  <div className="flex-1 min-w-0">
+                    <span className="text-[12px] font-semibold text-purple-400">{comment.userName}</span>
+                    <p className="text-[12px] text-[#D1C4E9] mt-0.5 break-words">{comment.text}</p>
+                  </div>
+                  <button onClick={() => deleteComment(comment.animeId, comment.id)}
+                    className="text-[#957DAD] hover:text-red-400 transition-colors flex-shrink-0 ml-2">
+                    <Trash2 size={12} />
+                  </button>
+                </div>
+
+                {/* Replies */}
+                {comment.replies?.length > 0 && (
+                  <div className="ml-4 mt-2 border-l-2 border-purple-500/20 pl-3 space-y-1.5">
+                    {comment.replies.map((r: any) => (
+                      <div key={r.id} className="bg-black/20 rounded-lg p-2 flex justify-between items-start">
+                        <div className="flex-1 min-w-0">
+                          <span className={`text-[11px] font-semibold ${r.userId === "admin" ? "text-green-400" : "text-[#957DAD]"}`}>
+                            {r.userName} {r.userId === "admin" && "✓"}
+                          </span>
+                          <p className="text-[11px] text-[#D1C4E9] break-words">{r.text}</p>
+                          <span className="text-[9px] text-[#957DAD]">{formatTime(r.timestamp)}</span>
+                        </div>
+                        <button onClick={() => deleteReply(comment.animeId, comment.id, r.id)}
+                          className="text-[#957DAD] hover:text-red-400 transition-colors flex-shrink-0 ml-2">
+                          <Trash2 size={10} />
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {/* Reply input */}
+                <div className="mt-2 flex gap-2">
+                  {replyingTo === comment.id ? (
+                    <div className="flex gap-2 w-full items-end">
+                      <textarea
+                        value={replyText}
+                        onChange={e => setReplyText(e.target.value)}
+                        onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); postAdminReply(comment.animeId, comment.id); } }}
+                        placeholder="Admin reply..."
+                        rows={1}
+                        className={`${inputClass} flex-1 !py-2 !text-xs resize-none min-h-[36px] max-h-[80px]`}
+                        onInput={(e: any) => { e.target.style.height = "auto"; e.target.style.height = Math.min(e.target.scrollHeight, 80) + "px"; }}
+                        autoFocus
+                      />
+                      <button onClick={() => postAdminReply(comment.animeId, comment.id)}
+                        className="bg-gradient-to-r from-green-600 to-green-800 text-white px-3 py-2 rounded-lg text-xs font-semibold flex items-center gap-1">
+                        <Send size={12} /> Send
+                      </button>
+                      <button onClick={() => { setReplyingTo(null); setReplyText(""); }}
+                        className="text-[#957DAD] hover:text-red-400 p-2">
+                        <X size={14} />
+                      </button>
+                    </div>
+                  ) : (
+                    <button
+                      onClick={() => { setReplyingTo(comment.id); setReplyText(""); }}
+                      className="text-[10px] text-purple-400 hover:text-purple-300 flex items-center gap-1 transition-colors"
+                    >
+                      <Reply size={12} /> Reply as Admin
+                    </button>
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
     </div>
   );
 };
